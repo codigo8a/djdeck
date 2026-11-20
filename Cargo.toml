@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/analysis", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["codigo8a"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+# El motor decodifica mp3 enteros en dev; sin optimizar tarda minutos.
+opt-level = 2
