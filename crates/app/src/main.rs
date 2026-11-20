@@ -10,7 +10,7 @@ use analysis::PeakPyramid;
 use anyhow::{Context, Result};
 use engine::sync::{self, BeatGrid};
 use engine::{Controls, PendingLoads, Track, DECK_COUNT};
-use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -589,6 +589,11 @@ fn main() -> Result<()> {
     }));
 
     let ui = AppWindow::new()?;
+    // DJDECK_FULLSCREEN=1 abre a pantalla completa: sirve cuando la ventana
+    // aparece detrás de otras o en un escritorio que no estás mirando.
+    if std::env::var("DJDECK_FULLSCREEN").is_ok() {
+        ui.window().set_fullscreen(true);
+    }
 
     // ---- carga inicial ----
     let mut loaded: [Option<Arc<Track>>; DECK_COUNT] = [None, None];
