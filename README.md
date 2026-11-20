@@ -136,6 +136,14 @@ dispositivo por subcadena del nombre; `DJDECK_FORMAT=s16|s32|f32` fuerza el form
 offsets distintos, y eso no suena a "dos canciones": suena a **chispeo** (peine de fase). Si ves
 el mensaje `ya hay una instancia de djdeck corriendo`, no es un error del motor.
 
+**Si escuchás por escritorio remoto** (RDP/VNC), el audio y el video de la ventana comparten el
+mismo enlace: `gnome-remote-desktop` captura el monitor del sink y lo codifica, y cada actualización
+de la interfaz compite con el stream de audio. El síntoma es un chispeo que aparece **sólo mientras
+hay sonido**, no depende del volumen, empeora cuanto más se mueve la ventana y **no existe en
+ninguna captura digital del motor** (medido: render idéntico a la referencia de soxr a −108 dB). No
+es la app: se arregla bajando el refresco de la UI (`DJDECK_UI_MS=1000`), bajando la calidad de video
+del cliente remoto, o escuchando en la máquina local.
+
 Para diagnosticar el camino de audio hay dos variables más: `DJDECK_DIAG=<segundos>` arranca la UI,
 reproduce los dos decks y reporta cada 5 s qué porcentaje de los frames se renderizaron, los xruns,
 las posiciones, los picos y el costo máximo del tick de UI; `DJDECK_UI_MS=<ms>` cambia el período de

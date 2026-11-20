@@ -28,6 +28,10 @@ struct Tap {
     escritas: usize,
 }
 
+/// Latencia del nodo en frames: 256 es el quantum por defecto de PipeWire.
+/// Pedir más que el quantum del grafo obliga a PipeWire a remuestrear el stream.
+const LATENCIA_NODO: u32 = 256;
+
 const TAP_MAX_FRAMES: usize = 48_000 * 2 * 180; // 180 s
 
 fn abrir_tap() -> Option<Tap> {
@@ -59,17 +63,17 @@ where
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(want_frames);
 
-    // pipewire-alsa negocia la latencia del nodo con esta variable. Sin ella el
-    // cliente pide 256 frames y arrastra el grafo a ciclos de 5.33 ms, aunque la
-    // app produzca bloques de 1024: el bloque no entra en un ciclo y PipeWire
-    // descarta fragmentos (se escucha como chispeo). Se pide la misma latencia
-    // que el buffer que vamos a usar.
-    if std::env::var_os("PIPEWIRE_LATENCY").is_none() && want_frames > 0 {
+    // Latencia que se le pide al nodo en PipeWire. Regla medida en este equipo:
+    // el cliente NUNCA debe pedir más que el quantum del grafo. Con el sink a 256
+    // frames y el cliente a 1024, PipeWire reconcilia quanta distintos con su
+    // remuestreador adaptativo y eso se escucha como chispeo continuo mientras
+    // hay señal (desaparece en silencio, no depende del volumen).
+    if std::env::var_os("PIPEWIRE_LATENCY").is_none() {
         let sr_previo: u32 = std::env::var("DJDECK_RATE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(48_000);
-        std::env::set_var("PIPEWIRE_LATENCY", format!("{want_frames}/{sr_previo}"));
+        std::env::set_var("PIPEWIRE_LATENCY", format!("{LATENCIA_NODO}/{sr_previo}"));
     }
     let host = cpal::default_host();
     let device = pick_device(&host)?;

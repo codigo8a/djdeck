@@ -4,10 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Dos binarios: la app y el banco de bisección de la UI (probe). Declarados
+# explícitamente para que `cargo run -p app` siga eligiendo `app`.
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
 [dependencies]
 engine = { path = "../engine" }
 analysis = { path = "../analysis" }
 anyhow = "1"
+cpal = "0.15"
 slint = { version = "1", default-features = false, features = [
     "std",
     "compat-1-2",

@@ -31,6 +31,8 @@ const LANE_W: u32 = 1180;
 /// el mismo proceso (se escucha como chispeo).
 /* WAVE_DIV: 2 (mitad de píxeles) no cambió el costo del tick: lo que cuesta es el repintado del Image, no el dibujo. Se deja en 2 por calidad visual. */
 const WAVE_DIV: u32 = 2;
+/// Cuántos carriles de ancho mide la tira de onda que se dibuja de una vez.
+const STRIP: u32 = 3;
 const LANE_H: u32 = 108;
 
 slint::slint! {
@@ -127,6 +129,9 @@ slint::slint! {
         in property <string> bpm-text: "—";
         in property <string> time-text: "0:00";
         in property <image> img;
+        // Desplazamiento de la tira de onda: la imagen se dibuja 3 carriles de
+        // ancho y se corre, en vez de redibujarla 30 veces por segundo.
+        in property <length> img-x: 0px;
         in property <color> accent: #22d3ee;
         in property <bool> synced: false;
 
@@ -148,7 +153,7 @@ slint::slint! {
                 background: #070a0e;
                 border-radius: 6px;
                 clip: true;
-                Image { source: root.img; width: 100%; height: 100%; }
+                Image { source: root.img; x: root.img-x; width: 300%; height: 100%; }
             }
         }
     }
@@ -434,7 +439,9 @@ slint::slint! {
         in-out property <float> eq-high-b: 0.0;
         in-out property <float> xf: 0.5;
         in-out property <image> wave-a;
+        in-out property <length> wave-a-x: 0px;
         in-out property <image> wave-b;
+        in-out property <length> wave-b-x: 0px;
         in-out property <string> zoom-text: "8 s";
         in-out property <string> status: "";
         in-out property <bool> browser-open: false;
@@ -503,6 +510,7 @@ slint::slint! {
                         time-text: root.time-a;
                         synced: root.synced-a;
                         img: root.wave-a;
+                        img-x: root.wave-a-x;
                     }
 
                     Lane {
@@ -514,6 +522,7 @@ slint::slint! {
                         time-text: root.time-b;
                         synced: root.synced-b;
                         img: root.wave-b;
+                        img-x: root.wave-b-x;
                     }
                 }
             }
@@ -636,6 +645,15 @@ struct BrowserState {
     /// Deck que recibirá el track elegido.
     target: usize,
     entries: Vec<PathBuf>,
+}
+
+/// Estado del último render de la tira de onda de un deck.
+#[derive(Clone, Copy, Default)]
+struct WaveRender {
+    center: f64,
+    zoom: f64,
+    rate: f64,
+    valido: bool,
 }
 
 fn main() -> Result<()> {
@@ -1122,6 +1140,7 @@ fn main() -> Result<()> {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(33);
+        let wave_state = Rc::new(RefCell::new([WaveRender::default(); DECK_COUNT]));
         let mut tick_n = 0u32;
         let mut tick_max = 0.0f64;
         let mut onda_max = 0.0f64;
@@ -1192,52 +1211,72 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Ondas apiladas: cada lane centrada en la posición de su deck.
-            // DJDECK_NO_WAVE=1 apaga sólo la actualización de las ondas: sirve
-            // para separar el costo de la imagen del costo del repintado.
-            let actualizar_ondas = std::env::var("DJDECK_NO_WAVE").is_err();
+            // Ondas: se dibuja una tira de STRIP carriles centrada en la posición
+            // y cada tick sólo se DESPLAZA. Redibujar la imagen 30 veces por
+            // segundo es lo que ensuciaba el audio (bisección con el binario
+            // `probe`: la etapa de la imagen es donde aparece el chispeo, con el
+            // contador de frames igual de sano). Ahora la imagen se rehace ~2
+            // veces por segundo y el scroll lo hace el offset.
+            // DJDECK_NO_WAVE=1 la apaga del todo (diagnóstico).
             let t_onda = std::time::Instant::now();
-            if actualizar_ondas {
-            let zoom = view.borrow().zoom_secs;
-            let frames_per_px = zoom * sr_f / (LANE_W / WAVE_DIV) as f64;
-            let (rate_a, rate_b) = (
-                engine::get_f32(&controls.rate[0]) as f64,
-                engine::get_f32(&controls.rate[1]) as f64,
-            );
-            let img_a = {
-                let st = decks.borrow();
-                st[0].pyramid.as_ref().map(|p| {
-                    render_lane(
-                        p,
-                        pos[0] * sr_f,
-                        frames_per_px,
-                        rate_a,
-                        (34, 211, 238),
-                        st[0].track.as_ref().map(|t| t.grid),
-                        sr_f,
-                    )
-                })
-            };
-            if let Some(img) = img_a {
-                ui.set_wave_a(img);
-            }
-            let img_b = {
-                let st = decks.borrow();
-                st[1].pyramid.as_ref().map(|p| {
-                    render_lane(
-                        p,
-                        pos[1] * sr_f,
-                        frames_per_px,
-                        rate_b,
-                        (251, 191, 36),
-                        st[1].track.as_ref().map(|t| t.grid),
-                        sr_f,
-                    )
-                })
-            };
-            if let Some(img) = img_b {
-                ui.set_wave_b(img);
-            }
+            if std::env::var("DJDECK_NO_WAVE").is_err() {
+                let zoom = view.borrow().zoom_secs;
+                let px = (LANE_W / WAVE_DIV) as f64; // ancho de un carril en píxeles
+                let frames_per_px = zoom * sr_f / px;
+                let rate = [
+                    engine::get_f32(&controls.rate[0]) as f64,
+                    engine::get_f32(&controls.rate[1]) as f64,
+                ];
+                let mut ws = wave_state.borrow_mut();
+                for i in 0..DECK_COUNT {
+                    let src_per_px = frames_per_px * rate[i];
+                    let ahora = pos[i] * sr_f;
+                    let necesita = !ws[i].valido
+                        || (ws[i].zoom - zoom).abs() > 1e-9
+                        || (ws[i].rate - rate[i]).abs() > 1e-9
+                        || ((ahora - ws[i].center) / src_per_px).abs() > px / 2.0;
+                    if necesita {
+                        let st = decks.borrow();
+                        if let Some(pyr) = st[i].pyramid.as_ref() {
+                            let img = render_lane(
+                                pyr,
+                                ahora,
+                                frames_per_px,
+                                rate[i],
+                                if i == 0 { (34, 211, 238) } else { (251, 191, 36) },
+                                st[i].track.as_ref().map(|t| t.grid),
+                                sr_f,
+                            );
+                            ws[i] = WaveRender {
+                                center: ahora,
+                                zoom,
+                                rate: rate[i],
+                                valido: true,
+                            };
+                            drop(st);
+                            if i == 0 {
+                                ui.set_wave_a(img);
+                            } else {
+                                ui.set_wave_b(img);
+                            }
+                        }
+                    }
+                    // La tira se dibujó centrada en ws[i].center: para que la
+                    // posición actual caiga en el centro del carril hay que
+                    // correrla -1 carril más la deriva, escalada a píxeles de
+                    // pantalla.
+                    let deriva = if ws[i].valido {
+                        ((ahora - ws[i].center) / src_per_px) as f32 * WAVE_DIV as f32
+                    } else {
+                        0.0
+                    };
+                    let x = -(LANE_W as f32) + deriva;
+                    if i == 0 {
+                        ui.set_wave_a_x(x);
+                    } else {
+                        ui.set_wave_b_x(x);
+                    }
+                }
             }
 
             let peaks = [
@@ -1530,8 +1569,9 @@ fn render_lane(
     grid: Option<BeatGrid>,
     sr: f64,
 ) -> Image {
-    // Buffer más angosto que el carril: el Image se escala al ancho real.
-    let (w, h) = (LANE_W / WAVE_DIV, LANE_H);
+    // Tira de STRIP carriles de ancho: el `Image` se dibuja 3 veces más ancho que
+    // el carril y se desplaza, así redibujar es cosa de ~2 veces por segundo.
+    let (w, h) = (LANE_W / WAVE_DIV * STRIP, LANE_H);
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
     let mid_y = h as f32 / 2.0;
     let mid_x = w as f32 / 2.0;

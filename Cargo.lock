@@ -141,6 +141,7 @@ version = "0.1.0"
 dependencies = [
  "analysis",
  "anyhow",
+ "cpal",
  "engine",
  "slint",
 ]
