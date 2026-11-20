@@ -10,9 +10,9 @@ use analysis::PeakPyramid;
 use anyhow::{Context, Result};
 use engine::sync::{self, BeatGrid};
 use engine::{Controls, PendingLoads, Track, DECK_COUNT};
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode};
+use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ const LANE_W: u32 = 1180;
 const LANE_H: u32 = 108;
 
 slint::slint! {
-    import { Button, Slider } from "std-widgets.slint";
+    import { Button, ScrollView, Slider } from "std-widgets.slint";
 
     component VuMeter inherits Rectangle {
         in property <float> level: 0.0;
@@ -41,6 +41,76 @@ slint::slint! {
             height: parent.height * Math.min(1.0, root.level);
             background: root.accent;
             border-radius: 3px;
+        }
+    }
+
+    export struct BrowserRow {
+        name: string,
+        is-dir: bool,
+    }
+
+    component Browser inherits Rectangle {
+        in property <string> path-text: "";
+        in property <[BrowserRow]> rows;
+        callback pick(int);
+        callback up();
+        callback close();
+
+        background: #000000b4;
+
+        panel := Rectangle {
+            width: 72%;
+            height: 74%;
+            background: #0f151c;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #2a3746;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "CARGAR EN DECK"; color: #66727f; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                    Text { text: root.path-text; color: #93a1b1; font-size: 11px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                    Button { text: "SUPERIOR"; clicked => { root.up(); } }
+                    Button { text: "CERRAR"; clicked => { root.close(); } }
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 1px;
+                        for row[i] in root.rows: Rectangle {
+                            height: 26px;
+                            background: ta.has-hover ? #1a2531 : transparent;
+                            border-radius: 4px;
+                            ta := TouchArea {
+                                clicked => { root.pick(i); }
+                            }
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                spacing: 8px;
+                                Text {
+                                    text: row.is-dir ? "▸" : "♪";
+                                    color: row.is-dir ? #22d3ee : #7e8b9a;
+                                    font-size: 11px;
+                                    width: 14px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: row.name;
+                                    color: row.is-dir ? #e3ecf5 : #a9b6c4;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -87,6 +157,7 @@ slint::slint! {
         in property <string> high-text: "0.0 dB";
         in property <bool> playing: false;
         in property <bool> synced: false;
+        in property <bool> looping: false;
         in property <float> meter: 0.0;
         in-out property <float> pitch-pct: 0.0;
         in-out property <float> gain: 0.8;
@@ -98,6 +169,8 @@ slint::slint! {
         callback play();
         callback cue();
         callback sync();
+        callback browse();
+        callback loop8();
         callback pitch-changed(float);
         callback gain-changed(float);
         callback eq-low-changed(float);
@@ -126,6 +199,8 @@ slint::slint! {
                 Button { text: root.playing ? "PAUSA" : "PLAY"; clicked => { root.play(); } }
                 Button { text: "CUE"; clicked => { root.cue(); } }
                 Button { text: root.synced ? "SYNC ON" : "SYNC"; clicked => { root.sync(); } }
+                Button { text: "CARGAR"; clicked => { root.browse(); } }
+                Button { text: root.looping ? "LOOP 8 ON" : "LOOP 8"; clicked => { root.loop8(); } }
                 Rectangle { horizontal-stretch: 1; }
                 VuMeter { level: root.meter; accent: root.accent; width: 10px; height: 26px; }
             }
@@ -251,6 +326,8 @@ slint::slint! {
         in-out property <bool> playing-b: false;
         in-out property <bool> synced-a: false;
         in-out property <bool> synced-b: false;
+        in-out property <bool> looping-a: false;
+        in-out property <bool> looping-b: false;
         in-out property <float> meter-a: 0.0;
         in-out property <float> meter-b: 0.0;
         in-out property <float> meter-master: 0.0;
@@ -269,6 +346,9 @@ slint::slint! {
         in-out property <image> wave-b;
         in-out property <string> zoom-text: "8 s";
         in-out property <string> status: "";
+        in-out property <bool> browser-open: false;
+        in-out property <string> browser-path: "";
+        in-out property <[BrowserRow]> browser-rows;
 
         callback play-a();
         callback play-b();
@@ -289,6 +369,13 @@ slint::slint! {
         callback xf-changed(float);
         callback zoom-in();
         callback zoom-out();
+        callback browse-a();
+        callback browse-b();
+        callback loop-a();
+        callback loop-b();
+        callback browser-pick(int);
+        callback browser-up();
+        callback browser-close();
 
         VerticalLayout {
             padding: 12px;
@@ -354,6 +441,7 @@ slint::slint! {
                     high-text: root.high-a-text;
                     playing: root.playing-a;
                     synced: root.synced-a;
+                    looping: root.looping-a;
                     meter: root.meter-a;
                     pitch-pct: root.pitch-a;
                     gain: root.gain-a;
@@ -363,6 +451,8 @@ slint::slint! {
                     play => { root.play-a(); }
                     cue => { root.cue-a(); }
                     sync => { root.sync-a(); }
+                    browse => { root.browse-a(); }
+                    loop8 => { root.loop-a(); }
                     pitch-changed(v) => { root.pitch-a = v; root.pitch-a-changed(v); }
                     gain-changed(v) => { root.gain-a = v; root.gain-a-changed(v); }
                     eq-low-changed(v) => { root.eq-low-a = v; root.eq-low-a-changed(v); }
@@ -392,6 +482,7 @@ slint::slint! {
                     high-text: root.high-b-text;
                     playing: root.playing-b;
                     synced: root.synced-b;
+                    looping: root.looping-b;
                     meter: root.meter-b;
                     pitch-pct: root.pitch-b;
                     gain: root.gain-b;
@@ -401,6 +492,8 @@ slint::slint! {
                     play => { root.play-b(); }
                     cue => { root.cue-b(); }
                     sync => { root.sync-b(); }
+                    browse => { root.browse-b(); }
+                    loop8 => { root.loop-b(); }
                     pitch-changed(v) => { root.pitch-b = v; root.pitch-b-changed(v); }
                     gain-changed(v) => { root.gain-b = v; root.gain-b-changed(v); }
                     eq-low-changed(v) => { root.eq-low-b = v; root.eq-low-b-changed(v); }
@@ -416,6 +509,18 @@ slint::slint! {
                 horizontal-alignment: center;
             }
         }
+
+        if root.browser-open: Browser {
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: 100%;
+            path-text: root.browser-path;
+            rows: root.browser-rows;
+            pick(i) => { root.browser-pick(i); }
+            up => { root.browser-up(); }
+            close => { root.browser-close(); }
+        }
     }
 }
 
@@ -423,11 +528,19 @@ struct DeckState {
     track: Option<Arc<Track>>,
     pyramid: Option<PeakPyramid>,
     syncing: bool,
+    looping: bool,
     pitch_pct: f64,
 }
 
 struct ViewState {
     zoom_secs: f64,
+}
+
+struct BrowserState {
+    dir: PathBuf,
+    /// Deck que recibirá el track elegido.
+    target: usize,
+    entries: Vec<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -457,16 +570,23 @@ fn main() -> Result<()> {
             track: None,
             pyramid: None,
             syncing: false,
+            looping: false,
             pitch_pct: 0.0,
         },
         DeckState {
             track: None,
             pyramid: None,
             syncing: false,
+            looping: false,
             pitch_pct: 0.0,
         },
     ]));
     let view = Rc::new(RefCell::new(ViewState { zoom_secs: 8.0 }));
+    let browser = Rc::new(RefCell::new(BrowserState {
+        dir: default_music_dir(),
+        target: 0,
+        entries: Vec::new(),
+    }));
 
     let ui = AppWindow::new()?;
 
@@ -482,18 +602,9 @@ fn main() -> Result<()> {
         for (i, path) in args.iter().take(DECK_COUNT).enumerate() {
             let p = Path::new(path);
             print!("analizando {} … ", p.display());
-            let decoded = engine::decode_file(p).with_context(|| format!("leyendo {path}"))?;
-            let samples = engine::resample_stereo(&decoded.samples, decoded.sample_rate, sr);
-            let (bpm, first) = analysis::detect_bpm(&samples, sr)
-                .ok_or_else(|| anyhow::anyhow!("no se pudo detectar el BPM de {path}"))?;
-            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
-            println!("{bpm:.1} BPM, primer beat {first:.3}s");
-            loaded[i] = Some(Arc::new(Track::new(
-                name,
-                samples,
-                sr,
-                BeatGrid::new(bpm, first),
-            )));
+            let (track, _pyr) = load_track(p, sr)?;
+            println!("{:.1} BPM, primer beat {:.3}s", track.grid.bpm, track.grid.first_beat);
+            loaded[i] = Some(track);
         }
     }
 
@@ -592,6 +703,18 @@ fn main() -> Result<()> {
         ui.on_xf_changed(move |v| engine::set_f32(&controls.crossfader, v));
     }
     {
+        let controls = controls.clone();
+        let decks = decks.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_loop_a(move || toggle_loop(&controls, &decks, &ui_weak, 0, sr));
+    }
+    {
+        let controls = controls.clone();
+        let decks = decks.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_loop_b(move || toggle_loop(&controls, &decks, &ui_weak, 1, sr));
+    }
+    {
         let view = view.clone();
         let ui_weak = ui.as_weak();
         ui.on_zoom_in(move || {
@@ -623,6 +746,147 @@ fn main() -> Result<()> {
         controls.playing[1].store(true, Ordering::Relaxed);
         decks.borrow_mut()[1].syncing = true;
         ui.set_synced_b(true);
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let browser = browser.clone();
+        ui.on_browse_a(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                browser.borrow_mut().target = 0;
+                refresh_browser(&ui, &browser);
+                ui.set_browser_open(true);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let browser = browser.clone();
+        ui.on_browse_b(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                browser.borrow_mut().target = 1;
+                refresh_browser(&ui, &browser);
+                ui.set_browser_open(true);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let browser = browser.clone();
+        ui.on_browser_up(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let parent = browser
+                .borrow()
+                .dir
+                .parent()
+                .map(|p| p.to_path_buf());
+            if let Some(parent) = parent {
+                browser.borrow_mut().dir = parent;
+                refresh_browser(&ui, &browser);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_browser_close(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_browser_open(false);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let browser = browser.clone();
+        let decks = decks.clone();
+        let pending = pending.clone();
+        let controls = controls.clone();
+        ui.on_browser_pick(move |idx| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let (chosen, target) = {
+                let st = browser.borrow();
+                (st.entries.get(idx.max(0) as usize).cloned(), st.target)
+            };
+            let Some(chosen) = chosen else { return };
+
+            if chosen.is_dir() {
+                browser.borrow_mut().dir = chosen;
+                refresh_browser(&ui, &browser);
+                return;
+            }
+
+            ui.set_status(format!("cargando {} …", chosen.display()).into());
+            match load_track(&chosen, sr) {
+                Ok((track, pyr)) => {
+                    pending.lock().unwrap().push((target, track.clone()));
+                    {
+                        let mut st = decks.borrow_mut();
+                        st[target].track = Some(track.clone());
+                        st[target].pyramid = Some(pyr);
+                        st[target].syncing = false;
+                        st[target].looping = false;
+                        st[target].pitch_pct = 0.0;
+                    }
+                    engine::set_f32(&controls.rate[target], 1.0);
+                    controls.loop_on[target].store(false, Ordering::Relaxed);
+                    engine::set_f32(&controls.eq_low[target], 0.0);
+                    engine::set_f32(&controls.eq_mid[target], 0.0);
+                    engine::set_f32(&controls.eq_high[target], 0.0);
+                    let name: slint::SharedString = track.name.clone().into();
+                    let bpm: slint::SharedString = format!("{:.1} BPM", track.grid.bpm).into();
+                    let zero: slint::SharedString = "+0.0%".into();
+                    let zero_db: slint::SharedString = "+0.0 dB".into();
+                    if target == 0 {
+                        ui.set_name_a(name);
+                        ui.set_bpm_a(bpm);
+                        ui.set_pitch_a_text(zero.clone());
+                        ui.set_pitch_a(0.0);
+                        ui.set_low_a_text(zero_db.clone());
+                        ui.set_mid_a_text(zero_db.clone());
+                        ui.set_high_a_text(zero_db);
+                        ui.set_synced_a(false);
+                        ui.set_looping_a(false);
+                    } else {
+                        ui.set_name_b(name);
+                        ui.set_bpm_b(bpm);
+                        ui.set_pitch_b_text(zero.clone());
+                        ui.set_pitch_b(0.0);
+                        ui.set_low_b_text(zero_db.clone());
+                        ui.set_mid_b_text(zero_db.clone());
+                        ui.set_high_b_text(zero_db);
+                        ui.set_synced_b(false);
+                        ui.set_looping_b(false);
+                    }
+                    ui.set_browser_open(false);
+                    ui.set_status(
+                        format!(
+                            "deck {} ← {} · {:.1} BPM",
+                            if target == 0 { "A" } else { "B" },
+                            track.name,
+                            track.grid.bpm
+                        )
+                        .into(),
+                    );
+                }
+                Err(e) => {
+                    ui.set_status(format!("no se pudo cargar {}: {e}", chosen.display()).into());
+                }
+            }
+        });
+    }
+
+    // DJDECK_BROWSER=1 abre el navegador en el deck A al arrancar (para revisar
+    // la lista sin tocar el mouse).
+    if std::env::var("DJDECK_BROWSER").is_ok() {
+        browser.borrow_mut().target = 0;
+        refresh_browser(&ui, &browser);
+        ui.set_browser_open(true);
+    }
+
+    // DJDECK_LOOP=1 activa el loop de 8 beats en A al arrancar (para revisar el
+    // estado del botón sin clickear).
+    if std::env::var("DJDECK_LOOP").is_ok() {
+        let ui_weak = ui.as_weak();
+        toggle_loop(&controls, &decks, &ui_weak, 0, sr);
     }
 
     ui.set_gain_a(engine::get_f32(&controls.gain[0]));
@@ -801,6 +1065,86 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+const AUDIO_EXT: [&str; 9] = ["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "aif", "aiff"];
+
+fn is_audio(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| AUDIO_EXT.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Carpeta inicial del navegador: `DJDECK_MUSIC`, si no Downloads, si no Música.
+fn default_music_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("DJDECK_MUSIC") {
+        let p = PathBuf::from(d);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    for cand in ["Downloads", "Music", "Música"] {
+        let p = PathBuf::from(&home).join(cand);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    PathBuf::from(home)
+}
+
+/// Decodifica, remuestrea, detecta BPM y arma la pirámide de picos.
+fn load_track(path: &Path, sr: u32) -> Result<(Arc<Track>, PeakPyramid)> {
+    let decoded = engine::decode_file(path).with_context(|| format!("leyendo {}", path.display()))?;
+    let samples = engine::resample_stereo(&decoded.samples, decoded.sample_rate, sr);
+    let (bpm, first) = analysis::detect_bpm(&samples, sr)
+        .ok_or_else(|| anyhow::anyhow!("no se pudo detectar el BPM"))?;
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+    let track = Arc::new(Track::new(name, samples, sr, BeatGrid::new(bpm, first)));
+    let pyramid = PeakPyramid::build(&track.samples, &[32, 128, 512, 2048, 8192, 32768]);
+    Ok((track, pyramid))
+}
+
+/// Relee la carpeta actual: carpetas primero, después archivos de audio.
+fn refresh_browser(ui: &AppWindow, browser: &Rc<RefCell<BrowserState>>) {
+    let dir = browser.borrow().dir.clone();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                if !name.starts_with('.') {
+                    dirs.push(path);
+                }
+            } else if is_audio(&path) {
+                files.push(path);
+            }
+        }
+    }
+    dirs.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default());
+    files.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default());
+
+    let mut all = dirs;
+    all.extend(files);
+
+    let rows: Vec<BrowserRow> = all
+        .iter()
+        .map(|p| BrowserRow {
+            name: p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .into(),
+            is_dir: p.is_dir(),
+        })
+        .collect();
+
+    browser.borrow_mut().entries = all;
+    ui.set_browser_path(dir.display().to_string().into());
+    ui.set_browser_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
 fn toggle_play(controls: &Arc<Controls>, deck: usize) {
     let cur = controls.playing[deck].load(Ordering::Relaxed);
     controls.playing[deck].store(!cur, Ordering::Relaxed);
@@ -825,6 +1169,51 @@ fn toggle_sync(decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, ui: &slint::Weak<Ap
             ui.set_synced_a(on);
         } else {
             ui.set_synced_b(on);
+        }
+    }
+}
+
+/// LOOP 8: engancha 8 beats desde el beat que contiene la posición actual.
+/// Al activarse, el motor envuelve dentro del rango con un fade de 2 ms.
+fn toggle_loop(
+    controls: &Arc<Controls>,
+    decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>,
+    ui: &slint::Weak<AppWindow>,
+    deck: usize,
+    sr: u32,
+) {
+    let mut st = decks.borrow_mut();
+    if st[deck].looping {
+        st[deck].looping = false;
+        controls.loop_on[deck].store(false, Ordering::Relaxed);
+    } else {
+        let Some(track) = st[deck].track.clone() else {
+            return;
+        };
+        let beat_frames = track.grid.beat_len() * sr as f64;
+        if beat_frames < 2.0 {
+            return;
+        }
+        let pos = controls.position[deck].load(Ordering::Relaxed) as f64;
+        let rel_beats = (pos / sr as f64 - track.grid.first_beat) / track.grid.beat_len();
+        let beat_k = rel_beats.floor().max(0.0);
+        let start = ((track.grid.first_beat + beat_k * track.grid.beat_len()) * sr as f64).max(0.0);
+        let end = (start + 8.0 * beat_frames).min(track.frames() as f64 - 1.0);
+        if end <= start + 2.0 {
+            return;
+        }
+        controls.loop_start[deck].store(start as u64, Ordering::Relaxed);
+        controls.loop_end[deck].store(end as u64, Ordering::Relaxed);
+        controls.loop_on[deck].store(true, Ordering::Relaxed);
+        st[deck].looping = true;
+    }
+    let on = st[deck].looping;
+    drop(st);
+    if let Some(ui) = ui.upgrade() {
+        if deck == 0 {
+            ui.set_looping_a(on);
+        } else {
+            ui.set_looping_b(on);
         }
     }
 }

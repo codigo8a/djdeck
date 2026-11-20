@@ -218,6 +218,61 @@ fn seek_salta_a_la_posicion_pedida() {
 }
 
 #[test]
+fn loop_de_8_beats_envuelve_y_no_clica() {
+    let mut h = Harness::new();
+    h.load(0, sine_track(440.0, 0.3, 5.0, false, false));
+    engine::set_f32(&h.controls.gain[0], 1.0);
+    engine::set_f32(&h.controls.master_gain, 1.0);
+    engine::set_f32(&h.controls.crossfader, 0.0);
+    h.controls.playing[0].store(true, Ordering::Relaxed);
+    // loop de 1 s a 2 s
+    h.controls.loop_start[0].store(SR as u64, Ordering::Relaxed);
+    h.controls.loop_end[0].store(SR as u64 * 2, Ordering::Relaxed);
+    h.controls.loop_on[0].store(true, Ordering::Relaxed);
+    h.controls.seek_request[0].store(SR as u64, Ordering::Relaxed);
+
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    let mut prev = 0.0f32;
+    let mut worst_step = 0.0f32;
+    for _ in 0..400 {
+        let out = h.render(256);
+        for v in out.iter() {
+            worst_step = worst_step.max((v - prev).abs());
+            prev = *v;
+        }
+        let pos = h.controls.position[0].load(Ordering::Relaxed);
+        min = min.min(pos);
+        max = max.max(pos);
+    }
+
+    assert!(min >= SR as u64 - 1, "no debe volver antes del inicio: {min}");
+    assert!(
+        max <= SR as u64 * 2 + 256,
+        "no debe pasar el fin del loop: {max}"
+    );
+    // Un seno de 440 Hz a 0.3 tiene saltos de ~0.017 por muestra; un corte
+    // seco en el borde del loop daría un salto de orden 0.3.
+    assert!(worst_step < 0.05, "click en el borde del loop: {worst_step}");
+}
+
+#[test]
+fn sin_loop_el_deck_sigue_de_largo() {
+    let mut h = Harness::new();
+    h.load(0, sine_track(440.0, 0.3, 3.0, false, false));
+    engine::set_f32(&h.controls.master_gain, 1.0);
+    h.controls.playing[0].store(true, Ordering::Relaxed);
+    h.controls.loop_start[0].store(SR as u64, Ordering::Relaxed);
+    h.controls.loop_end[0].store(SR as u64 * 2, Ordering::Relaxed);
+    // loop_on queda en false
+    for _ in 0..800 {
+        let _ = h.render(256);
+    }
+    let pos = h.controls.position[0].load(Ordering::Relaxed);
+    assert!(pos > SR as u64 * 2, "sin loop debe pasar de los 2 s: {pos}");
+}
+
+#[test]
 fn control_de_play_para_el_deck() {
     let mut h = Harness::new();
     h.load(0, sine_track(440.0, 0.3, 5.0, false, false));

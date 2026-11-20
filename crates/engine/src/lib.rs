@@ -38,6 +38,10 @@ pub struct Controls {
     pub playing: [AtomicBool; DECK_COUNT],
     pub rate: [AtomicU32; DECK_COUNT],
     pub gain: [AtomicU32; DECK_COUNT],
+    /// Loop activo por deck, con su rango en frames del dispositivo.
+    pub loop_on: [AtomicBool; DECK_COUNT],
+    pub loop_start: [AtomicU64; DECK_COUNT],
+    pub loop_end: [AtomicU64; DECK_COUNT],
     /// EQ de 3 bandas en dB (±12). 0 dB en las tres = camino sin EQ.
     pub eq_low: [AtomicU32; DECK_COUNT],
     pub eq_mid: [AtomicU32; DECK_COUNT],
@@ -65,6 +69,9 @@ impl Default for Controls {
             playing: [AtomicBool::new(false), AtomicBool::new(false)],
             rate: [AtomicU32::new(1.0f32.to_bits()), AtomicU32::new(1.0f32.to_bits())],
             gain: [AtomicU32::new(0.8f32.to_bits()), AtomicU32::new(0.8f32.to_bits())],
+            loop_on: [AtomicBool::new(false), AtomicBool::new(false)],
+            loop_start: [AtomicU64::new(0), AtomicU64::new(0)],
+            loop_end: [AtomicU64::new(0), AtomicU64::new(0)],
             eq_low: [AtomicU32::new(0), AtomicU32::new(0)],
             eq_mid: [AtomicU32::new(0), AtomicU32::new(0)],
             eq_high: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -170,6 +177,9 @@ pub fn soft_clip(x: f32) -> f32 {
     }
 }
 
+/// Fade de 2 ms en el borde del loop para no clicar.
+const LOOP_FADE: i32 = 96;
+
 struct Deck {
     track: Option<Arc<Track>>,
     pos: f64,
@@ -177,6 +187,10 @@ struct Deck {
     rate: f64,
     gain: f32,
     eq: Eq,
+    loop_on: bool,
+    loop_start: f64,
+    loop_end: f64,
+    fade_in: i32,
 }
 
 impl Deck {
@@ -188,6 +202,10 @@ impl Deck {
             rate: 1.0,
             gain: 0.8,
             eq: Eq::new(sample_rate),
+            loop_on: false,
+            loop_start: 0.0,
+            loop_end: 0.0,
+            fade_in: 0,
         }
     }
 
@@ -201,6 +219,8 @@ impl Deck {
     }
 
     /// Siguiente frame del deck, o `None` si está parado o terminó.
+    /// Si hay loop, la posición envuelve dentro del rango con un fade de 2 ms
+    /// en el borde: el salto de un loop es inevitable, el click no.
     #[inline]
     fn next_frame(&mut self) -> Option<(f32, f32)> {
         if !self.playing {
@@ -208,11 +228,35 @@ impl Deck {
         }
         let track = self.track.as_ref()?;
         let last = track.frames().saturating_sub(1) as f64;
+        let looping = self.loop_on && self.loop_end > self.loop_start + 2.0;
+
+        if looping && self.pos >= self.loop_end {
+            let over = self.pos - self.loop_end;
+            self.pos = self.loop_start + over;
+            self.fade_in = LOOP_FADE;
+        }
         if self.pos >= last {
             self.playing = false;
             return None;
         }
-        let (l, r) = frame_at(&track.samples, self.pos);
+
+        let (mut l, mut r) = frame_at(&track.samples, self.pos);
+        if looping {
+            let fade = LOOP_FADE as f64;
+            let remaining = self.loop_end - self.pos;
+            if remaining < fade && remaining > 0.0 {
+                let g = (remaining / fade) as f32;
+                l *= g;
+                r *= g;
+            }
+            if self.fade_in > 0 {
+                let g = 1.0 - self.fade_in as f32 / LOOP_FADE as f32;
+                l *= g;
+                r *= g;
+                self.fade_in -= 1;
+            }
+        }
+
         self.pos += self.rate;
         Some(self.eq.process_stereo(l, r))
     }
@@ -278,6 +322,9 @@ impl Mixer {
             if seek != u64::MAX {
                 deck.seek(seek as f64);
             }
+            deck.loop_on = self.controls.loop_on[i].load(Ordering::Relaxed);
+            deck.loop_start = self.controls.loop_start[i].load(Ordering::Relaxed) as f64;
+            deck.loop_end = self.controls.loop_end[i].load(Ordering::Relaxed) as f64;
             deck.eq.set_gains(
                 get_f32(&self.controls.eq_low[i]),
                 get_f32(&self.controls.eq_mid[i]),

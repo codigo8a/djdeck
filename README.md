@@ -17,6 +17,8 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
   kicks de los dos temas caen en la misma vertical.
 - Pitch fader ±8 % (modo vinilo: cambia tempo *y* tono — ver deudas). Con SYNC activo el fader y el
   texto se mueven con el lazo: muestra el % real que aplicó el sync y el BPM destino (`126.2 → 131.9`).
+- `LOOP 8`: engancha 8 beats desde el beat que contiene la posición actual y envuelve con un fade de
+  2 ms en el borde (medido: el salto máximo entre muestras en el loop queda bajo 0.05, sin click).
 - EQ de 3 bandas **real** por deck (low shelf 200 Hz, campana 1 kHz, high shelf 4 kHz, ±12 dB), con
   bypass exacto cuando las tres están en 0 dB.
 - Gain por canal + crossfader equal-power (−3 dB en el centro) + limitador suave.
@@ -33,7 +35,7 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
 | Cue / prelisten | los dos decks suenan por la misma salida: **no sirve para tocar en vivo todavía**. |
 | Filtro (LPF/HPF) | el EQ es de 3 bandas; el filtro por canal todavía no está. |
 | Platos / jog wheels | decisión explícita: no se usan; el transporte es por botones y el pitch por fader. |
-| Hotcues y loops | sólo el cue al primer beat. |
+| Hotcues y loops manuales | hay loop de 8 beats al vuelo; faltan loop in/out a mano, 1/2/4/16 beats y hotcues. |
 | Biblioteca / base de datos | los tracks se pasan por línea de comandos. |
 | Detección de compás (downbeat) | el sync alinea a nivel de beat, no de compás: dos temas pueden quedar alineados a contratiempo. |
 | Stems | no hay separación de voces/instrumental. En esta máquina demucs.cpp mide 0.094× tiempo real: es trabajo de importación, no de reproducción. |
@@ -78,13 +80,13 @@ suma analítica de dos decks idénticos (±1e-5), separación de canales, mute p
 posiciones y longitudes, seek, conservación de frecuencia en el remuestreo 44.1→48 kHz, y convergencia
 del sync a <0.02 beat de error tras 5 s en una mezcla de 60 s, y el EQ (identidad exacta en 0 dB,
 shelf de graves +12 dB ≈ 4x, shelf de agudos −12 dB, campana de 1 kHz que no toca los 60 Hz).
-**17 tests, todos en verde.**
+**19 tests, todos en verde.**
 
 ### Medido en el equipo objetivo (Celeron N5095, Debian 13, PipeWire)
 
 | Prueba | Resultado |
 |---|---|
-| `cargo test` | 17/17 en verde (10 render + 4 EQ + 3 analysis) |
+| `cargo test` | 19/19 en verde (12 render + 4 EQ + 3 analysis) |
 | Sync offline, 30 s a 127.4 vs 128.0 BPM | peor error de fase tras 5 s: **0.0001 beats**; sin saturar (pico 0.946) |
 | Sync con dispositivo real, 30 s | peor error de fase: **0.001 beats**; 0 xruns; 100.0 % del tiempo real renderizado |
 | Buffer 1024 frames (21.3 ms) | 99.7 % del tiempo real, callback de 1024/256 frames, 0 xruns |
@@ -102,7 +104,7 @@ dispositivo por subcadena del nombre.
 2. Cue a segunda placa de audio.
 3. Filtro por canal (LPF/HPF) y EQ con knobs en vez de sliders.
 4. Downbeat/phrase (beat-this con golden set) — alinear a compás, no sólo a beat.
-5. Hotcues, loops con quantize, biblioteca SQLite.
+5. Hotcues, loops manuales con quantize, biblioteca SQLite.
 6. Stems precalculados al importar (motor de 4 stems por deck).
 7. MIDI learn, grabación del set, empaquetado `.deb`/AppImage.
 
