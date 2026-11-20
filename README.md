@@ -82,7 +82,25 @@ suma analítica de dos decks idénticos (±1e-5), separación de canales, mute p
 posiciones y longitudes, seek, conservación de frecuencia en el remuestreo 44.1→48 kHz, y convergencia
 del sync a <0.02 beat de error tras 5 s en una mezcla de 60 s, y el EQ (identidad exacta en 0 dB,
 shelf de graves +12 dB ≈ 4x, shelf de agudos −12 dB, campana de 1 kHz que no toca los 60 Hz).
-**19 tests, todos en verde.**
+**30 tests, todos en verde.**
+
+`cargo test -p engine --test audio_quality` mide **calidad**, no sólo comportamiento: analiza el
+espectro de lo que el motor renderiza (ventana Blackman-Harris, espurios in-band contra la
+fundamental) y fija cotas superiores de distorsión. Un arreglo que mejore la calidad sigue pasando;
+una regresión falla. Lo medido hoy, con los puntos flojos declarados como deuda:
+
+| Medición | Hoy |
+|---|---|
+| Pitch en 0 % | **bit-exacto** (desvío 0) |
+| EQ en 0 dB | **bit-exacto**, y el EQ activo cumple escalado y superposición (<1e-4) |
+| Limiter bajo 0.8 de entrada | transparente (−103 dB) |
+| Limiter a 1.35 de entrada | −18.9 dB con armónico en 3 kHz *(deuda: es un tanh, sin lookahead)* |
+| Remuestreo 44.1→48, 1 kHz | −89 dB |
+| Remuestreo 44.1→48, 10 kHz / 15 kHz | **−26 dB / −14 dB por imágenes aliasadas** *(deuda: Catmull-Rom no tiene filtro anti-imagen)* |
+| Pitch ±2…8 %, 1 kHz | −64 dB |
+| Pitch +8 %, 10 kHz / 15 kHz | **−22 dB / −13.5 dB** *(deuda: `frame_at` interpola lineal; un cúbico lo bajaría ~40 dB)* |
+| EQ mid +12 dB | **−12.9 dB** *(deuda: el EQ va antes del limiter y no compensa headroom)* |
+| Dos decks al centro, master 0.9 | −58 dB contra la suma lineal ideal |
 
 ### Medido en el equipo objetivo (Celeron N5095, Debian 13, PipeWire)
 
