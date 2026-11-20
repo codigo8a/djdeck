@@ -15,7 +15,9 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
 - Ondas **apiladas** (A arriba, B abajo) sobre el mismo eje de tiempo, con zoom de 1 a 64 s,
   rejilla de beats (cada 4 más marcada) y playhead fijo al centro: si el sync está bien, los
   kicks de los dos temas caen en la misma vertical.
-- Pitch fader ±8 % (modo vinilo: cambia tempo *y* tono — ver deudas). Con SYNC activo el fader y el
+- Pitch fader ±8 % (modo vinilo: cambia tempo *y* tono — ver deudas). **Doble click en el fader
+  vuelve a 0 % en el centro**; si ese deck estaba en SYNC, el doble click apaga su SYNC, porque el
+  lazo de sync reescribe el rate a 30 Hz y el 0 % no duraría un frame. Con SYNC activo el fader y el
   texto se mueven con el lazo: muestra el % real que aplicó el sync y el BPM destino (`126.2 → 131.9`).
 - `LOOP 8`: engancha 8 beats desde el beat que contiene la posición actual y envuelve con un fade de
   2 ms en el borde (medido: el salto máximo entre muestras en el loop queda bajo 0.05, sin click).

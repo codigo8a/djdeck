@@ -146,6 +146,84 @@ slint::slint! {
         }
     }
 
+    // Fader horizontal con marca del valor por defecto y doble click para
+    // volver a él. Lo usa el pitch: doble click en el fader = 0.0 % (centro).
+    // No asigna `value` por dentro: sólo emite `changed`, así el rate del motor
+    // sigue siendo la única fuente de verdad y el lazo de sync manda el fader.
+    component Fader inherits Rectangle {
+        in property <float> minimum: -8.0;
+        in property <float> maximum: 8.0;
+        in property <float> reset-value: 0.0;
+        in property <color> accent: #0f6b7a;
+        in-out property <float> value: 0.0;
+        callback changed(float);
+        callback reset();
+
+        height: 26px;
+        horizontal-stretch: 1;
+        property <length> handle-w: 10px;
+        property <float> span: Math.max(root.maximum - root.minimum, 0.000001);
+        property <float> frac: Math.min(1.0, Math.max(0.0, (root.value - root.minimum) / root.span));
+        property <float> reset-frac: Math.min(1.0, Math.max(0.0, (root.reset-value - root.minimum) / root.span));
+        property <length> track-x: root.handle-w / 2;
+        property <length> track-w: Math.max(root.width - root.handle-w, 1px);
+        property <length> handle-x: root.track-x + root.track-w * root.frac - root.handle-w / 2;
+        property <length> reset-x: root.track-x + root.track-w * root.reset-frac;
+        property <length> fill-x: root.track-x + root.track-w * Math.min(root.frac, root.reset-frac);
+        property <length> fill-w: root.track-w * Math.abs(root.frac - root.reset-frac);
+
+        function frac-at(x: length) -> float {
+            Math.min(1.0, Math.max(0.0, (x - root.track-x) / root.track-w))
+        }
+
+        // carril
+        Rectangle {
+            x: root.track-x;
+            width: root.track-w;
+            y: (root.height - self.height) / 2;
+            height: 4px;
+            background: #1f2833;
+            border-radius: 2px;
+        }
+
+        // recorrido desde el centro hasta la perilla
+        Rectangle {
+            x: root.fill-x;
+            width: root.fill-w;
+            y: (root.height - self.height) / 2;
+            height: 4px;
+            background: root.accent.with-alpha(0.45);
+            border-radius: 2px;
+        }
+
+        // marca del valor por defecto (en el pitch: el centro)
+        Rectangle {
+            x: root.reset-x - 0.5px;
+            width: 1px;
+            y: (root.height - 14px) / 2;
+            height: 14px;
+            background: #66727f;
+        }
+
+        // perilla
+        Rectangle {
+            x: root.handle-x;
+            width: root.handle-w;
+            y: 2px;
+            height: root.height - 4px;
+            background: touch.pressed ? #e8eef5 : #93a0af;
+            border-width: 1px;
+            border-color: #2b3644;
+            border-radius: 3px;
+        }
+
+        touch := TouchArea {
+            moved => { root.changed(root.minimum + root.frac-at(self.mouse-x) * root.span); }
+            clicked => { root.changed(root.minimum + root.frac-at(self.mouse-x) * root.span); }
+            double-clicked => { root.reset(); }
+        }
+    }
+
     component DeckPanel inherits Rectangle {
         in property <string> label: "A";
         in property <string> track-name: "sin cargar";
@@ -172,6 +250,7 @@ slint::slint! {
         callback browse();
         callback loop8();
         callback pitch-changed(float);
+        callback pitch-reset();
         callback gain-changed(float);
         callback eq-low-changed(float);
         callback eq-mid-changed(float);
@@ -208,9 +287,14 @@ slint::slint! {
             HorizontalLayout {
                 spacing: 6px;
                 Text { text: "PITCH"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
-                Slider {
-                    minimum: -8.0; maximum: 8.0; value: root.pitch-pct;
-                    changed(v) => { root.pitch-pct = v; root.pitch-changed(v); }
+                Fader {
+                    minimum: -8.0;
+                    maximum: 8.0;
+                    reset-value: 0.0;
+                    accent: root.accent;
+                    value: root.pitch-pct;
+                    changed(v) => { root.pitch-changed(v); }
+                    reset => { root.pitch-reset(); }
                 }
                 Text { text: root.pitch-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
             }
@@ -358,6 +442,8 @@ slint::slint! {
         callback sync-b();
         callback pitch-a-changed(float);
         callback pitch-b-changed(float);
+        callback pitch-reset-a();
+        callback pitch-reset-b();
         callback gain-a-changed(float);
         callback gain-b-changed(float);
         callback eq-low-a-changed(float);
@@ -454,6 +540,7 @@ slint::slint! {
                     browse => { root.browse-a(); }
                     loop8 => { root.loop-a(); }
                     pitch-changed(v) => { root.pitch-a = v; root.pitch-a-changed(v); }
+                    pitch-reset => { root.pitch-reset-a(); }
                     gain-changed(v) => { root.gain-a = v; root.gain-a-changed(v); }
                     eq-low-changed(v) => { root.eq-low-a = v; root.eq-low-a-changed(v); }
                     eq-mid-changed(v) => { root.eq-mid-a = v; root.eq-mid-a-changed(v); }
@@ -495,6 +582,7 @@ slint::slint! {
                     browse => { root.browse-b(); }
                     loop8 => { root.loop-b(); }
                     pitch-changed(v) => { root.pitch-b = v; root.pitch-b-changed(v); }
+                    pitch-reset => { root.pitch-reset-b(); }
                     gain-changed(v) => { root.gain-b = v; root.gain-b-changed(v); }
                     eq-low-changed(v) => { root.eq-low-b = v; root.eq-low-b-changed(v); }
                     eq-mid-changed(v) => { root.eq-mid-b = v; root.eq-mid-b-changed(v); }
@@ -670,6 +758,18 @@ fn main() -> Result<()> {
         let controls = controls.clone();
         let decks = decks.clone();
         ui.on_pitch_b_changed(move |v| set_pitch(&controls, &decks, 1, v));
+    }
+    {
+        let controls = controls.clone();
+        let decks = decks.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_pitch_reset_a(move || reset_pitch(&controls, &decks, &ui_weak, 0));
+    }
+    {
+        let controls = controls.clone();
+        let decks = decks.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_pitch_reset_b(move || reset_pitch(&controls, &decks, &ui_weak, 1));
     }
     {
         let controls = controls.clone();
@@ -1232,6 +1332,21 @@ fn set_pitch(controls: &Arc<Controls>, decks: &Rc<RefCell<[DeckState; DECK_COUNT
         }
     }
     engine::set_f32(&controls.rate[deck], 1.0 + pct / 100.0);
+}
+
+/// Doble click en el fader de pitch: vuelve al 0 %.
+/// Con SYNC activo el lazo reescribe el rate a 30 Hz y el 0 % no dura un frame,
+/// así que el reset apaga el sync de ese deck primero.
+fn reset_pitch(
+    controls: &Arc<Controls>,
+    decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>,
+    ui: &slint::Weak<AppWindow>,
+    deck: usize,
+) {
+    if decks.borrow()[deck].syncing {
+        toggle_sync(decks, ui, deck);
+    }
+    set_pitch(controls, decks, deck, 0.0);
 }
 
 fn fmt_time(pos: f64, len: f64) -> String {
