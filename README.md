@@ -116,12 +116,24 @@ medido a 0.5 dB de diferencia entre 2 kHz y 9 kHz; con el pasa-banda mide 16 dB.
 | Sync con dispositivo real, 30 s | peor error de fase: **0.001 beats**; 0 xruns; 100.0 % del tiempo real renderizado |
 | Buffer 1024 frames (21.3 ms) | 99.7 % del tiempo real, callback de 1024/256 frames, 0 xruns |
 | Buffer 256 frames (5.3 ms) | **84 % del tiempo real**: pipewire-alsa entra en underrun sostenido y el reloj de audio se atrasa. Por eso el default es 1024 |
+| Quantum 256 vs 1024 en el grafo de PipeWire | Con 256 el cliente tiene **5.33 ms** de margen por ciclo y un repintado de la UI (4–7 ms) lo hace llegar tarde: **98 % de los frames** renderizados, un chasquido cada ~300 ms. La app ahora pide `PIPEWIRE_LATENCY = buffer/SR` al abrir el dispositivo (1024/48000) y el nodo negocia 21.3 ms en vez de 5.33 |
 | Detección de BPM, material real | "Can't Get You Out Of My Head" → **126.2** (real 126); remix de Tiësto → 131.9 |
 | UI con las dos ondas a 30 Hz (binario debug) | 35 % de un núcleo, 217 MB RSS, 0 underruns en 100 s |
 | Sync de 126.2 contra 131.9 BPM | offset aplicado **+4.5 %**, rejillas alineadas en pantalla, `126.2 → 131.9` |
 
 `DJDECK_FRAMES` y `DJDECK_RATE` permiten forzar buffer y frecuencia; `DJDECK_DEVICE` fuerza un
-dispositivo por subcadena del nombre.
+dispositivo por subcadena del nombre; `DJDECK_FORMAT=s16|s32|f32` fuerza el formato de muestra
+(default `f32`).
+
+**Importante**: la app pide una sola instancia. Dos djdeck a la vez suman el mismo audio con
+offsets distintos, y eso no suena a "dos canciones": suena a **chispeo** (peine de fase). Si ves
+el mensaje `ya hay una instancia de djdeck corriendo`, no es un error del motor.
+
+Para diagnosticar el camino de audio hay dos variables más: `DJDECK_DIAG=<segundos>` arranca la UI,
+reproduce los dos decks y reporta cada 5 s qué porcentaje de los frames se renderizaron, los xruns,
+las posiciones, los picos y el costo máximo del tick de UI; `DJDECK_UI_MS=<ms>` cambia el período de
+refresco (default 33 ms) para medir cuánto come el render de las ondas. El `%` tiene que quedar en
+99.9 o más: cada décima que falta son bloques descartados, o sea chasquidos.
 
 ## Roadmap
 

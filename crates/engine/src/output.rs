@@ -14,8 +14,30 @@ use crate::{Controls, Mixer, PendingLoads};
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, Stream, StreamConfig, SupportedStreamConfigRange};
+use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// Tap de diagnóstico: `DJDECK_TAP=/ruta/salida.f32` graba exactamente los
+/// frames que se le entregan al dispositivo (raw f32le entrelazado al SR del
+/// device). Sirve para separar "la app genera basura" de "la basura aparece
+/// después": se analiza el archivo y se sabe de qué lado está el problema.
+struct Tap {
+    w: std::io::BufWriter<std::fs::File>,
+    escritas: usize,
+}
+
+const TAP_MAX_FRAMES: usize = 48_000 * 2 * 180; // 180 s
+
+fn abrir_tap() -> Option<Tap> {
+    let path = std::env::var("DJDECK_TAP").ok()?;
+    let f = std::fs::File::create(&path).ok()?;
+    println!("tap: grabando lo que va al dispositivo en {path} (f32le, 2 canales, 180 s máx)");
+    Some(Tap {
+        w: std::io::BufWriter::with_capacity(1 << 16, f),
+        escritas: 0,
+    })
+}
 
 pub struct AudioOutput {
     /// Mantener vivo el stream: al dropearlo se cierra el dispositivo.
@@ -24,6 +46,7 @@ pub struct AudioOutput {
     pub channels: u16,
     pub buffer_frames: u32,
     pub device_name: String,
+    pub sample_format: SampleFormat,
 }
 
 pub fn start(controls: Arc<Controls>, pending: PendingLoads, want_frames: u32) -> Result<AudioOutput> {
@@ -31,6 +54,19 @@ pub fn start(controls: Arc<Controls>, pending: PendingLoads, want_frames: u32) -
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(want_frames);
+
+    // pipewire-alsa negocia la latencia del nodo con esta variable. Sin ella el
+    // cliente pide 256 frames y arrastra el grafo a ciclos de 5.33 ms, aunque la
+    // app produzca bloques de 1024: el bloque no entra en un ciclo y PipeWire
+    // descarta fragmentos (se escucha como chispeo). Se pide la misma latencia
+    // que el buffer que vamos a usar.
+    if std::env::var_os("PIPEWIRE_LATENCY").is_none() && want_frames > 0 {
+        let sr_previo: u32 = std::env::var("DJDECK_RATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48_000);
+        std::env::set_var("PIPEWIRE_LATENCY", format!("{want_frames}/{sr_previo}"));
+    }
     let host = cpal::default_host();
     let device = pick_device(&host)?;
     let device_name = match device.name() {
@@ -54,10 +90,25 @@ pub fn start(controls: Arc<Controls>, pending: PendingLoads, want_frames: u32) -
         match sample_format {
             SampleFormat::F32 => {
                 let mut mixer = mixer;
+                let mut tap = abrir_tap();
                 device
                     .build_output_stream(
                         &cfg,
-                        move |data: &mut [f32], _| mixer.render(data),
+                        move |data: &mut [f32], _| {
+                            mixer.render(data);
+                            if let Some(t) = tap.as_mut() {
+                                if t.escritas < TAP_MAX_FRAMES {
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(
+                                            data.as_ptr() as *const u8,
+                                            data.len() * 4,
+                                        )
+                                    };
+                                    let _ = t.w.write_all(bytes);
+                                    t.escritas += data.len();
+                                }
+                            }
+                        },
                         err_fn,
                         None,
                     )
@@ -77,6 +128,27 @@ pub fn start(controls: Arc<Controls>, pending: PendingLoads, want_frames: u32) -
                             mixer.render(buf);
                             for (dst, src) in data.iter_mut().zip(buf.iter()) {
                                 *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                            }
+                        },
+                        err_fn,
+                        None,
+                    )
+                    .map_err(|e| anyhow!("{e}"))
+            }
+            SampleFormat::I32 => {
+                let mut mixer = mixer;
+                let mut scratch = vec![0.0f32; 16_384];
+                device
+                    .build_output_stream(
+                        &cfg,
+                        move |data: &mut [i32], _| {
+                            if scratch.len() < data.len() {
+                                scratch.resize(data.len(), 0.0);
+                            }
+                            let buf = &mut scratch[..data.len()];
+                            mixer.render(buf);
+                            for (dst, src) in data.iter_mut().zip(buf.iter()) {
+                                *dst = (src.clamp(-1.0, 1.0) * i32::MAX as f32) as i32;
                             }
                         },
                         err_fn,
@@ -108,6 +180,7 @@ pub fn start(controls: Arc<Controls>, pending: PendingLoads, want_frames: u32) -
         channels,
         buffer_frames,
         device_name,
+        sample_format,
     })
 }
 
@@ -133,25 +206,46 @@ fn pick_device(host: &cpal::Host) -> Result<cpal::Device> {
 }
 
 /// Prefiere 48 kHz estéreo; si no, el default del dispositivo.
+///
+/// `DJDECK_FORMAT=s16|s32|f32` fuerza el formato de muestra. Importa: medido en
+/// este equipo, el camino de **float** del plugin de ALSA mete chispeo leve
+/// (dos regrabaciones: F32 con chispa, S16 limpio), y la app hablaba en F32.
 fn choose_config(device: &cpal::Device) -> Result<(StreamConfig, SampleFormat)> {
     let wanted_rate: u32 = std::env::var("DJDECK_RATE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(48_000);
 
+    let preferido = match std::env::var("DJDECK_FORMAT").ok().as_deref() {
+        Some("s16") => SampleFormat::I16,
+        Some("s32") => SampleFormat::I32,
+        _ => SampleFormat::F32,
+    };
+
     if let Ok(ranges) = device.supported_output_configs() {
         let mut candidates: Vec<SupportedStreamConfigRange> = ranges.collect();
-        // Primero f32 (el motor mezcla en f32), después i16.
-        candidates.sort_by_key(|r| match r.sample_format() {
-            SampleFormat::F32 => 0,
-            SampleFormat::I16 => 1,
-            _ => 2,
+        // Primero el pedido, después el resto en orden de preferencia.
+        candidates.sort_by_key(|r| {
+            let f = r.sample_format();
+            if f == preferido {
+                0
+            } else {
+                match f {
+                    SampleFormat::I16 => 1,
+                    SampleFormat::I32 => 2,
+                    SampleFormat::F32 => 3,
+                    _ => 4,
+                }
+            }
         });
         for range in candidates {
             if range.channels() != 2 {
                 continue;
             }
-            if !matches!(range.sample_format(), SampleFormat::F32 | SampleFormat::I16) {
+            if !matches!(
+                range.sample_format(),
+                SampleFormat::F32 | SampleFormat::I16 | SampleFormat::I32
+            ) {
                 continue;
             }
             if range.min_sample_rate().0 <= wanted_rate && range.max_sample_rate().0 >= wanted_rate {

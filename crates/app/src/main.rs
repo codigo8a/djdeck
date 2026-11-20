@@ -645,12 +645,22 @@ fn main() -> Result<()> {
     let controls = Arc::new(Controls::default());
     let pending: PendingLoads = Arc::new(Mutex::new(Vec::new()));
 
+    // Una sola instancia: dos procesos de djdeck suman el mismo audio con
+    // offsets distintos y eso se escucha como peine de fase ("chispeo").
+    let _instancia = match tomar_instancia_unica() {
+        Some(lock) => lock,
+        None => {
+            eprintln!("ya hay una instancia de djdeck corriendo; cerrala antes de abrir otra");
+            return Ok(());
+        }
+    };
+
     let out = engine::output::start(controls.clone(), pending.clone(), DEFAULT_FRAMES)?;
     let sr = out.sample_rate;
     let latency_ms = out.buffer_frames as f64 * 1000.0 / sr as f64;
     println!(
-        "dispositivo: {} | {} Hz | {} canales | {} frames ({:.1} ms)",
-        out.device_name, sr, out.channels, out.buffer_frames, latency_ms
+        "dispositivo: {} | {} Hz | {} canales | {} frames ({:.1} ms) | formato {:?}",
+        out.device_name, sr, out.channels, out.buffer_frames, latency_ms, out.sample_format
     );
 
     let decks = Rc::new(RefCell::new([
@@ -699,6 +709,65 @@ fn main() -> Result<()> {
             println!("{:.1} BPM, primer beat {:.3}s", track.grid.bpm, track.grid.first_beat);
             loaded[i] = Some(track);
         }
+    }
+
+    // ---- diagnóstico con la UI andando: `DJDECK_DIAG=<segundos>` ----
+    // Reproduce los dos decks y reporta cada 5 s si el callback llega a tiempo.
+    // Sin ventana (--autoplay) la UI no compite por CPU, así que no sirve para
+    // medir el caso real: acá sí corre el lazo de 30 Hz con las ondas.
+    if let Ok(secs) = std::env::var("DJDECK_DIAG") {
+        let secs: u64 = secs.parse().unwrap_or(20);
+        for d in 0..DECK_COUNT {
+            controls.playing[d].store(true, Ordering::Relaxed);
+        }
+        ui.set_playing_a(true);
+        ui.set_playing_b(true);
+        let controls = controls.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let base = controls.frames_rendered.load(Ordering::Relaxed);
+            let mut ultimo = 0.0f64;
+            let mut pico_win = [0.0f32; DECK_COUNT];
+            let mut pico_master_win = 0.0f32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // master_peak y peak[] son del ÚLTIMO bloque: hay que muestrear
+                // seguido y quedarse con el máximo de la ventana.
+                for d in 0..DECK_COUNT {
+                    pico_win[d] = pico_win[d].max(engine::get_f32(&controls.peak[d]));
+                }
+                pico_master_win = pico_master_win.max(engine::get_f32(&controls.master_peak));
+                let el = t0.elapsed().as_secs_f64();
+                if el - ultimo < 5.0 {
+                    continue;
+                }
+                ultimo = el;
+                let rend = controls.frames_rendered.load(Ordering::Relaxed) - base;
+                let esperado = (el * sr as f64) as u64;
+                let pos: Vec<String> = (0..DECK_COUNT)
+                    .map(|d| {
+                        format!(
+                            "{:.2}/{:.1}s",
+                            controls.position[d].load(Ordering::Relaxed) as f64 / sr as f64,
+                            controls.length[d].load(Ordering::Relaxed) as f64 / sr as f64
+                        )
+                    })
+                    .collect();
+                println!(
+                    "diag {el:5.1}s | render {:.2} % | xruns {} | pos {} | pico decks {:?} | pico master {:.3}",
+                    100.0 * rend as f64 / esperado.max(1) as f64,
+                    controls.xruns.load(Ordering::Relaxed),
+                    pos.join(" "),
+                    pico_win,
+                    pico_master_win
+                );
+                pico_win = [0.0f32; DECK_COUNT];
+                pico_master_win = 0.0f32;
+                if el as u64 >= secs {
+                    std::process::exit(0);
+                }
+            }
+        });
     }
 
     for i in 0..DECK_COUNT {
@@ -1014,8 +1083,19 @@ fn main() -> Result<()> {
         let ui_weak = ui.as_weak();
         let sr_f = sr as f64;
         let timer = Timer::default();
-        timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
+        // El refresco de la UI se puede frenar con DJDECK_UI_MS para medir
+        // cuánto del presupuesto de audio se come el render de las ondas.
+        let ui_ms = std::env::var("DJDECK_UI_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(33);
+        let mut tick_n = 0u32;
+        let mut tick_max = 0.0f64;
+        let mut onda_max = 0.0f64;
+        let diag_on = std::env::var("DJDECK_DIAG").is_ok();
+        timer.start(TimerMode::Repeated, Duration::from_millis(ui_ms), move || {
             let Some(ui) = ui_weak.upgrade() else { return };
+            let t_tick = std::time::Instant::now();
 
             let pos: Vec<f64> = (0..DECK_COUNT)
                 .map(|i| controls.position[i].load(Ordering::Relaxed) as f64 / sr_f)
@@ -1080,6 +1160,7 @@ fn main() -> Result<()> {
             }
 
             // Ondas apiladas: cada lane centrada en la posición de su deck.
+            let t_onda = std::time::Instant::now();
             let zoom = view.borrow().zoom_secs;
             let frames_per_px = zoom * sr_f / LANE_W as f64;
             let (rate_a, rate_b) = (
@@ -1125,6 +1206,8 @@ fn main() -> Result<()> {
                 engine::get_f32(&controls.peak[0]),
                 engine::get_f32(&controls.peak[1]),
             ];
+            onda_max = onda_max.max(t_onda.elapsed().as_secs_f64() * 1000.0);
+
             ui.set_meter_a((peaks[0] * 5.0).min(1.0));
             ui.set_meter_b((peaks[1] * 5.0).min(1.0));
             ui.set_meter_master((engine::get_f32(&controls.master_peak) * 5.0).min(1.0));
@@ -1132,6 +1215,19 @@ fn main() -> Result<()> {
             ui.set_playing_b(controls.playing[1].load(Ordering::Relaxed));
             ui.set_time_a(fmt_time(pos[0], len[0]).into());
             ui.set_time_b(fmt_time(pos[1], len[1]).into());
+
+            // Costo del tick: si se acerca al período del buffer, el callback de
+            // audio pierde el turno y se cae un bloque (chasquido).
+            tick_n += 1;
+            tick_max = tick_max.max(t_tick.elapsed().as_secs_f64() * 1000.0);
+            if diag_on && tick_n % 150 == 0 {
+                println!(
+                    "ui: tick máx {:.1} ms | ondas máx {:.1} ms (período del buffer 21.3 ms)",
+                    tick_max, onda_max
+                );
+                tick_max = 0.0;
+                onda_max = 0.0;
+            }
 
             let gains = [
                 engine::get_f32(&controls.gain[0]),
@@ -1195,6 +1291,34 @@ fn default_music_dir() -> PathBuf {
         }
     }
     PathBuf::from(home)
+}
+
+/// Candado de instancia única: dos djdeck a la vez suman el mismo audio con
+/// offsets distintos (peine de fase) y suenan a chispeo. Si el PID guardado ya
+/// no existe, el candado se considera viejo y se toma.
+struct InstanceLock {
+    path: PathBuf,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn tomar_instancia_unica() -> Option<InstanceLock> {
+    let path = std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| PathBuf::from(d).join("djdeck.lock"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("djdeck.lock"));
+    if let Ok(txt) = std::fs::read_to_string(&path) {
+        if let Ok(pid) = txt.trim().parse::<u32>() {
+            if Path::new(&format!("/proc/{pid}")).exists() {
+                return None;
+            }
+        }
+    }
+    std::fs::write(&path, std::process::id().to_string()).ok()?;
+    Some(InstanceLock { path })
 }
 
 /// Decodifica, remuestrea, detecta BPM y arma la pirámide de picos.
@@ -1732,14 +1856,16 @@ fn make_demo_track(bpm: f64, sr: u32, detune_semitones: f64) -> Track {
         let pattern = [0, 0, 7, 5];
         let semis = pattern[beat_idx % pattern.len()] as f64;
         let f = root * 2f64.powf(semis / 12.0);
-        let bass_len = (beat * 0.9 * sr as f64) as usize;
+        let bass_len = (beat * sr as f64) as usize;
         for i in 0..bass_len {
             let idx = start + i;
             if idx >= frames {
                 break;
             }
             let tt = i as f64 / sr as f64;
-            let env = (-tt * 4.0).exp() * (1.0 - tt / (beat * 0.9)).max(0.0);
+            // El bajo llena el beat completo: con 0.9 beat quedaban 47 ms de
+            // silencio exacto antes de cada beat y el demo tartamudeaba.
+            let env = (-tt * 4.0).exp() * (1.0 - tt / beat).max(0.0);
             let v = ((tt * f * std::f64::consts::TAU).sin() * env * 0.22) as f32;
             samples[idx * 2] += v;
             samples[idx * 2 + 1] += v;
@@ -1813,6 +1939,34 @@ mod demo_tests {
             db_9k > db_16k + 6.0,
             "el hat debe tener 6 dB menos en 16 kHz que en 9 kHz: 9 kHz {db_9k:.1} dB, 16 kHz {db_16k:.1} dB"
         );
+    }
+
+    #[test]
+    fn el_demo_no_tiene_huecos_de_silencio() {
+        // Medido con el tap de la app: entre el fin del bajo (0.9 beat) y el
+        // beat siguiente quedaban 2262 frames de silencio EXACTO cada 471 ms,
+        // o sea 10 % de cada beat en silencio: un tartamudeo a tempo que suena
+        // a chispeo. Se exige que no haya ninguna racha de silencio digital de
+        // más de 10 ms (480 frames).
+        for bpm in [127.4, 128.0] {
+            let demo = make_demo_track(bpm, SR, 0.0);
+            let mut run = 0usize;
+            let mut max_run = 0usize;
+            for i in 0..demo.frames() {
+                if demo.samples[i * 2] == 0.0 && demo.samples[i * 2 + 1] == 0.0 {
+                    run += 1;
+                    max_run = max_run.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+            assert!(
+                max_run < 480,
+                "{bpm} BPM: hueco de silencio de {:.1} ms ({} frames), el demo tartamudea",
+                max_run as f64 / 48.0,
+                max_run
+            );
+        }
     }
 
     #[test]
