@@ -82,7 +82,7 @@ suma analítica de dos decks idénticos (±1e-5), separación de canales, mute p
 posiciones y longitudes, seek, conservación de frecuencia en el remuestreo 44.1→48 kHz, y convergencia
 del sync a <0.02 beat de error tras 5 s en una mezcla de 60 s, y el EQ (identidad exacta en 0 dB,
 shelf de graves +12 dB ≈ 4x, shelf de agudos −12 dB, campana de 1 kHz que no toca los 60 Hz).
-**30 tests, todos en verde.**
+**32 tests, todos en verde.**
 
 `cargo test -p engine --test audio_quality` mide **calidad**, no sólo comportamiento: analiza el
 espectro de lo que el motor renderiza (ventana Blackman-Harris, espurios in-band contra la
@@ -101,6 +101,11 @@ una regresión falla. Lo medido hoy, con los puntos flojos declarados como deuda
 | Pitch +8 %, 10 kHz / 15 kHz | **−22 dB / −13.5 dB** *(deuda: `frame_at` interpola lineal; un cúbico lo bajaría ~40 dB)* |
 | EQ mid +12 dB | **−12.9 dB** *(deuda: el EQ va antes del limiter y no compensa headroom)* |
 | Dos decks al centro, master 0.9 | −58 dB contra la suma lineal ideal |
+
+Los dos tests de `cargo test -p app` fijan el contenido del demo sintético, que es lo que suena
+cuando no se pasan archivos: el hat tiene que estar limitado a su banda (6–12 kHz) y el tema tiene
+que tener ancho estéreo real. Antes el hat era ruido blanco crudo —energía plana hasta Nyquist—
+medido a 0.5 dB de diferencia entre 2 kHz y 9 kHz; con el pasa-banda mide 16 dB.
 
 ### Medido en el equipo objetivo (Celeron N5095, Debian 13, PipeWire)
 

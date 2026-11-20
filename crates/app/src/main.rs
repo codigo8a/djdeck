@@ -1654,6 +1654,17 @@ fn run_device_test(secs: u64) -> Result<()> {
 }
 
 /// Track sintético: kick en cada beat, hat en la corchea y bajo.
+/// Pasa-banda RBJ (0 dB en el pico) para el hat del demo: f0 9 kHz con Q 1.4,
+/// o sea unos 6-12 kHz de banda. Con b1 = 0 devuelve (b0, b2, a1, a2).
+fn hat_bandpass_coeffs(sr: f32) -> (f32, f32, f32, f32) {
+    let (f0, q) = (9_000.0f32, 1.4f32);
+    let w0 = 2.0 * std::f32::consts::PI * f0 / sr;
+    let (sin, cos) = (w0.sin(), w0.cos());
+    let alpha = sin / (2.0 * q);
+    let a0 = 1.0 + alpha;
+    (alpha / a0, -alpha / a0, (-2.0 * cos) / a0, (1.0 - alpha) / a0)
+}
+
 fn make_demo_track(bpm: f64, sr: u32, detune_semitones: f64) -> Track {
     let seconds = 32.0;
     let frames = (seconds * sr as f64) as usize;
@@ -1682,18 +1693,40 @@ fn make_demo_track(bpm: f64, sr: u32, detune_semitones: f64) -> Track {
 
         let hat_start = start + (beat * 0.5 * sr as f64) as usize;
         let hat_len = (sr as f64 * 0.04) as usize;
-        let mut seed = 12345u32.wrapping_add(beat_idx as u32 * 7919);
+        // Hat de banda limitada: ruido pasado por un pasa-banda 6-12 kHz, con
+        // una semilla por canal y paneo alternado. El ruido blanco crudo tenia
+        // energia plana hasta Nyquist (siseo) y los dos canales identicos.
+        let (b0, b2, a1, a2) = hat_bandpass_coeffs(sr as f32);
+        let pan = if beat_idx % 2 == 0 { 0.18f32 } else { -0.18f32 };
+        let (gan_l, gan_r) = (1.0 - pan * 0.5, 1.0 + pan * 0.5);
+        let mut canales = [vec![0.0f32; hat_len], vec![0.0f32; hat_len]];
+        for (ch, buf) in canales.iter_mut().enumerate() {
+            let mut seed = 12345u32
+                .wrapping_add(beat_idx as u32 * 7919)
+                .wrapping_add(ch as u32 * 1_048_573);
+            let (mut z0, mut z1) = (0.0f32, 0.0f32);
+            for (i, out) in buf.iter_mut().enumerate() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let noise = ((seed >> 9) as f32 / (1 << 23) as f32) * 2.0 - 1.0;
+                let y = b0 * noise + z0;
+                z0 = -a1 * y + z1;
+                z1 = b2 * noise - a2 * y;
+                let env = (-(i as f32) / sr as f32 * 60.0).exp();
+                *out = y * env;
+            }
+        }
+        let pico_hat = canales[0]
+            .iter()
+            .chain(canales[1].iter())
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        let escala = if pico_hat > 0.0 { 0.22 / pico_hat } else { 0.0 };
         for i in 0..hat_len {
             let idx = hat_start + i;
             if idx >= frames {
                 break;
             }
-            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            let noise = ((seed >> 9) as f32 / (1 << 23) as f32) * 2.0 - 1.0;
-            let env = 1.0 - i as f32 / hat_len as f32;
-            let v = noise * env * 0.08;
-            samples[idx * 2] += v;
-            samples[idx * 2 + 1] += v;
+            samples[idx * 2] += canales[0][i] * escala * gan_l;
+            samples[idx * 2 + 1] += canales[1][i] * escala * gan_r;
         }
 
         let pattern = [0, 0, 7, 5];
@@ -1722,4 +1755,84 @@ fn make_demo_track(bpm: f64, sr: u32, detune_semitones: f64) -> Track {
         sr,
         BeatGrid::new(bpm, 0.0),
     )
+}
+
+#[cfg(test)]
+mod demo_tests {
+    use super::*;
+
+    const SR: u32 = 48_000;
+
+    /// Energía en una frecuencia por Goertzel, con ventana de Hann.
+    fn goertzel_db(x: &[f32], f: f64) -> f64 {
+        let n = x.len();
+        let w = 2.0 * std::f64::consts::PI * f / SR as f64;
+        let coeff = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for (i, v) in x.iter().enumerate() {
+            let hann = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos();
+            let s0 = *v as f64 * hann + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        let power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+        10.0 * (power / n as f64).log10()
+    }
+
+    fn canal(demo: &Track, desde_frame: usize, frames: usize, ch: usize) -> Vec<f32> {
+        (desde_frame..desde_frame + frames)
+            .map(|i| demo.samples[i * 2 + ch])
+            .collect()
+    }
+
+    /// El hat cae a medio beat del primer tiempo. El kick dura 180 ms y el hat
+    /// arranca en beat*0.5 (234 ms a 128 BPM), así que la ventana es sólo hat
+    /// más el bajo, que vive por debajo de 110 Hz.
+    fn ventana_del_hat(demo: &Track) -> (usize, usize) {
+        let beat = 60.0 / demo.grid.bpm;
+        let start = (beat * 0.5 * SR as f64) as usize;
+        (start, (SR as f64 * 0.04) as usize)
+    }
+
+    #[test]
+    fn el_hat_del_demo_esta_limitado_a_su_banda() {
+        // Ruido blanco crudo = energía plana hasta Nyquist: suena a siseo. Un
+        // hat de verdad vive en 6-12 kHz. El test compara 9 kHz contra 2 kHz
+        // (por debajo de la banda) y 16 kHz (por encima).
+        let demo = make_demo_track(128.0, SR, 0.0);
+        let (start, len) = ventana_del_hat(&demo);
+        let hat = canal(&demo, start, len, 0);
+        let db_2k = goertzel_db(&hat, 2_000.0);
+        let db_9k = goertzel_db(&hat, 9_000.0);
+        let db_16k = goertzel_db(&hat, 16_000.0);
+        assert!(
+            db_9k > db_2k + 10.0,
+            "el hat debe tener 10 dB menos en 2 kHz que en 9 kHz: 2 kHz {db_2k:.1} dB, 9 kHz {db_9k:.1} dB"
+        );
+        assert!(
+            db_9k > db_16k + 6.0,
+            "el hat debe tener 6 dB menos en 16 kHz que en 9 kHz: 9 kHz {db_9k:.1} dB, 16 kHz {db_16k:.1} dB"
+        );
+    }
+
+    #[test]
+    fn el_demo_tiene_imagen_estereo() {
+        // Antes todo se sumaba igual en L y R (mono exacto, correlación 1). El
+        // ancho tiene que venir de los hats decorrelacionados: la energía de la
+        // diferencia L-R deja de ser cero.
+        let demo = make_demo_track(128.0, SR, 0.0);
+        let mut dif = 0.0f64;
+        let mut tot = 0.0f64;
+        for i in 0..demo.frames() {
+            let l = demo.samples[i * 2] as f64;
+            let r = demo.samples[i * 2 + 1] as f64;
+            dif += (l - r) * (l - r);
+            tot += l * l;
+        }
+        let ratio = dif / tot;
+        assert!(
+            ratio > 1e-3,
+            "el demo debe tener ancho estéreo real, energía L-R / L = {ratio:e}"
+        );
+    }
 }
