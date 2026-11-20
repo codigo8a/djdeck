@@ -187,6 +187,67 @@ pub fn peaks(samples: &[f32], buckets: usize) -> Peaks {
     Peaks { min, max }
 }
 
+/// Un nivel de la pirámide: un bucket cada `frames_per_bucket` frames.
+pub struct LevelPeaks {
+    pub frames_per_bucket: usize,
+    pub min: Vec<f32>,
+    pub max: Vec<f32>,
+}
+
+/// Pirámide de picos para dibujar la waveform a cualquier zoom sin recorrer
+/// muestras: se elige el nivel cuyo bucket mide ~1 px.
+pub struct PeakPyramid {
+    pub levels: Vec<LevelPeaks>,
+    pub frames: usize,
+    /// Pico global del track, para normalizar el dibujo.
+    pub norm: f32,
+}
+
+impl PeakPyramid {
+    pub fn build(samples: &[f32], frames_per_bucket: &[usize]) -> Self {
+        let frames = samples.len() / 2;
+        let levels = frames_per_bucket
+            .iter()
+            .copied()
+            .filter(|fpb| *fpb > 0)
+            .map(|fpb| {
+                let buckets = (frames / fpb).max(1);
+                let p = bucket_peaks(samples, buckets);
+                LevelPeaks {
+                    frames_per_bucket: fpb,
+                    min: p.min,
+                    max: p.max,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let norm = levels
+            .iter()
+            .flat_map(|l| l.max.iter().map(|v| v.abs()).chain(l.min.iter().map(|v| v.abs())))
+            .fold(0.0f32, f32::max)
+            .max(0.01);
+
+        Self {
+            levels,
+            frames,
+            norm,
+        }
+    }
+
+    /// Nivel con el bucket más cercano a `frames_per_px` (1 bucket ≈ 1 px).
+    pub fn level_for(&self, frames_per_px: f64) -> Option<&LevelPeaks> {
+        self.levels.iter().min_by(|a, b| {
+            let da = (a.frames_per_bucket as f64 - frames_per_px).abs();
+            let db = (b.frames_per_bucket as f64 - frames_per_px).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+
+fn bucket_peaks(samples: &[f32], buckets: usize) -> Peaks {
+    peaks(samples, buckets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

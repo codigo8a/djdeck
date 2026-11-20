@@ -9,6 +9,7 @@
 //!    buffer cualquiera) y por eso se puede testear sin placa de sonido.
 
 pub mod decode;
+pub mod eq;
 pub mod output;
 pub mod resample;
 pub mod sync;
@@ -21,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use sync::BeatGrid;
 
 pub use decode::{decode_file, DecodedAudio};
+pub use eq::Eq;
 pub use resample::resample_stereo;
 
 /// Mínimo audible de un beat a 120 BPM ≈ 4 ms; la deadband de fase es menor.
@@ -36,6 +38,10 @@ pub struct Controls {
     pub playing: [AtomicBool; DECK_COUNT],
     pub rate: [AtomicU32; DECK_COUNT],
     pub gain: [AtomicU32; DECK_COUNT],
+    /// EQ de 3 bandas en dB (±12). 0 dB en las tres = camino sin EQ.
+    pub eq_low: [AtomicU32; DECK_COUNT],
+    pub eq_mid: [AtomicU32; DECK_COUNT],
+    pub eq_high: [AtomicU32; DECK_COUNT],
     /// Posición actual en frames @ SR del dispositivo (la publica el callback).
     pub position: [AtomicU64; DECK_COUNT],
     pub length: [AtomicU64; DECK_COUNT],
@@ -59,6 +65,9 @@ impl Default for Controls {
             playing: [AtomicBool::new(false), AtomicBool::new(false)],
             rate: [AtomicU32::new(1.0f32.to_bits()), AtomicU32::new(1.0f32.to_bits())],
             gain: [AtomicU32::new(0.8f32.to_bits()), AtomicU32::new(0.8f32.to_bits())],
+            eq_low: [AtomicU32::new(0), AtomicU32::new(0)],
+            eq_mid: [AtomicU32::new(0), AtomicU32::new(0)],
+            eq_high: [AtomicU32::new(0), AtomicU32::new(0)],
             position: [AtomicU64::new(0), AtomicU64::new(0)],
             length: [AtomicU64::new(0), AtomicU64::new(0)],
             peak: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -167,16 +176,18 @@ struct Deck {
     playing: bool,
     rate: f64,
     gain: f32,
+    eq: Eq,
 }
 
 impl Deck {
-    fn empty() -> Self {
+    fn new(sample_rate: u32) -> Self {
         Self {
             track: None,
             pos: 0.0,
             playing: false,
             rate: 1.0,
             gain: 0.8,
+            eq: Eq::new(sample_rate),
         }
     }
 
@@ -203,7 +214,7 @@ impl Deck {
         }
         let (l, r) = frame_at(&track.samples, self.pos);
         self.pos += self.rate;
-        Some((l, r))
+        Some(self.eq.process_stereo(l, r))
     }
 }
 
@@ -217,7 +228,7 @@ pub struct Mixer {
 impl Mixer {
     pub fn new(controls: Arc<Controls>, pending: PendingLoads, sample_rate: u32) -> Self {
         Self {
-            decks: [Deck::empty(), Deck::empty()],
+            decks: [Deck::new(sample_rate), Deck::new(sample_rate)],
             controls,
             pending,
             sample_rate,
@@ -267,6 +278,12 @@ impl Mixer {
             if seek != u64::MAX {
                 deck.seek(seek as f64);
             }
+            deck.eq.set_gains(
+                get_f32(&self.controls.eq_low[i]),
+                get_f32(&self.controls.eq_mid[i]),
+                get_f32(&self.controls.eq_high[i]),
+                self.sample_rate,
+            );
         }
 
         let mut peaks = [0.0f32; DECK_COUNT];

@@ -1,10 +1,12 @@
-//! djdeck — MVP: dos decks, mezcla y sync.
+//! djdeck — MVP: dos decks, mixer, EQ y sync por beatgrid.
 //!
 //! Uso:
-//!   djdeck "track-a.mp3" "track-b.flac"     # carga dos archivos
-//!   djdeck                                  # arranca con dos demos sintéticos
+//!   djdeck "track-a.mp3" "track-b.flac"
+//!   djdeck                              # demos sintéticos
+//!   djdeck --selftest                   # verificación offline
+//!   djdeck --autoplay=30                # verificación con la placa real
 
-use analysis::Peaks;
+use analysis::PeakPyramid;
 use anyhow::{Context, Result};
 use engine::sync::{self, BeatGrid};
 use engine::{Controls, PendingLoads, Track, DECK_COUNT};
@@ -16,38 +18,81 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// 1024 frames ≈ 21 ms de buffer: medido estable en PipeWire (256 frames produce
+/// underruns sostenidos y el reloj de audio se atrasa ~16 %). Se puede forzar con
+/// `DJDECK_FRAMES`.
+const DEFAULT_FRAMES: u32 = 1024;
+/// Ancho del bitmap de cada onda; Slint lo escala al ancho real.
+const LANE_W: u32 = 1180;
+const LANE_H: u32 = 108;
+
 slint::slint! {
     import { Button, Slider } from "std-widgets.slint";
 
-    component Meter inherits Rectangle {
+    component VuMeter inherits Rectangle {
         in property <float> level: 0.0;
         in property <color> accent: #22d3ee;
-        height: 6px;
-        background: #0a0d11;
+        width: 14px;
+        background: #070a0e;
         border-radius: 3px;
         Rectangle {
-            x: 0;
-            width: parent.width * Math.min(1.0, root.level);
-            height: parent.height;
+            y: parent.height - parent.height * Math.min(1.0, root.level);
+            width: parent.width;
+            height: parent.height * Math.min(1.0, root.level);
             background: root.accent;
             border-radius: 3px;
         }
     }
 
-    component Deck inherits Rectangle {
+    component Lane inherits Rectangle {
         in property <string> label: "A";
         in property <string> track-name: "sin cargar";
         in property <string> bpm-text: "—";
         in property <string> time-text: "0:00";
-        in property <string> pitch-text: "0.0%";
+        in property <image> img;
+        in property <color> accent: #22d3ee;
+        in property <bool> synced: false;
+
+        VerticalLayout {
+            spacing: 3px;
+            HorizontalLayout {
+                spacing: 8px;
+                height: 16px;
+                Text { text: root.label; color: root.accent; font-size: 12px; font-weight: 800; vertical-alignment: center; }
+                Text { text: root.track-name; color: #a9b6c4; font-size: 11px; overflow: elide; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: root.synced ? "SYNC" : ""; color: root.accent; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                Text { text: root.bpm-text; color: #8b98a8; font-size: 11px; vertical-alignment: center; }
+                Text { text: root.time-text; color: #66727f; font-size: 11px; vertical-alignment: center; }
+            }
+            Rectangle {
+                vertical-stretch: 1;
+                min-height: 84px;
+                background: #070a0e;
+                border-radius: 6px;
+                clip: true;
+                Image { source: root.img; width: 100%; height: 100%; }
+            }
+        }
+    }
+
+    component DeckPanel inherits Rectangle {
+        in property <string> label: "A";
+        in property <string> track-name: "sin cargar";
+        in property <string> bpm-text: "—";
+        in property <string> pitch-text: "+0.0%";
         in property <string> gain-text: "80%";
+        in property <string> low-text: "0.0 dB";
+        in property <string> mid-text: "0.0 dB";
+        in property <string> high-text: "0.0 dB";
         in property <bool> playing: false;
         in property <bool> synced: false;
-        in property <image> wave;
-        in property <float> head: 0.0;
         in property <float> meter: 0.0;
         in-out property <float> pitch-pct: 0.0;
         in-out property <float> gain: 0.8;
+        in-out property <float> eq-low: 0.0;
+        in-out property <float> eq-mid: 0.0;
+        in-out property <float> eq-high: 0.0;
         in property <color> accent: #22d3ee;
 
         callback play();
@@ -55,166 +100,174 @@ slint::slint! {
         callback sync();
         callback pitch-changed(float);
         callback gain-changed(float);
+        callback eq-low-changed(float);
+        callback eq-mid-changed(float);
+        callback eq-high-changed(float);
 
-        background: #151a21;
-        border-radius: 12px;
+        background: #12171d;
+        border-radius: 10px;
         border-width: 1px;
-        border-color: #232c37;
+        border-color: #1f2833;
 
         VerticalLayout {
-            padding: 14px;
-            spacing: 10px;
-
-            HorizontalLayout {
-                spacing: 10px;
-                Text {
-                    text: root.label;
-                    color: root.accent;
-                    font-size: 20px;
-                    font-weight: 800;
-                }
-                Text {
-                    text: root.track-name;
-                    color: #dbe4ee;
-                    font-size: 13px;
-                    overflow: elide;
-                    vertical-alignment: center;
-                }
-                Rectangle { horizontal-stretch: 1; }
-                Text {
-                    text: root.bpm-text;
-                    color: #8b98a8;
-                    font-size: 13px;
-                    vertical-alignment: center;
-                }
-                Text {
-                    text: root.time-text;
-                    color: #8b98a8;
-                    font-size: 13px;
-                    vertical-alignment: center;
-                }
-            }
-
-            wf := Rectangle {
-                min-height: 120px;
-                vertical-stretch: 1;
-                background: #080b0f;
-                border-radius: 8px;
-                clip: true;
-                Image {
-                    source: root.wave;
-                    width: 100%;
-                    height: 100%;
-                }
-                Rectangle {
-                    x: (wf.width - 2px) * root.head;
-                    width: 2px;
-                    height: wf.height;
-                    background: white;
-                }
-            }
+            padding: 12px;
+            spacing: 8px;
 
             HorizontalLayout {
                 spacing: 8px;
-                Button {
-                    text: root.playing ? "PAUSA" : "PLAY";
-                    clicked => { root.play(); }
-                }
-                Button {
-                    text: "CUE";
-                    clicked => { root.cue(); }
-                }
-                Button {
-                    text: root.synced ? "SYNC ON" : "SYNC";
-                    clicked => { root.sync(); }
-                }
+                Text { text: root.label; color: root.accent; font-size: 18px; font-weight: 800; }
+                Text { text: root.track-name; color: #dbe4ee; font-size: 12px; overflow: elide; vertical-alignment: center; }
                 Rectangle { horizontal-stretch: 1; }
-                Meter { level: root.meter; accent: root.accent; width: 90px; }
+                Text { text: root.bpm-text; color: #8b98a8; font-size: 12px; vertical-alignment: center; }
             }
 
             HorizontalLayout {
-                spacing: 8px;
-                Text {
-                    text: "PITCH";
-                    color: #6b7787;
-                    font-size: 11px;
-                    width: 42px;
-                    vertical-alignment: center;
-                }
+                spacing: 6px;
+                Button { text: root.playing ? "PAUSA" : "PLAY"; clicked => { root.play(); } }
+                Button { text: "CUE"; clicked => { root.cue(); } }
+                Button { text: root.synced ? "SYNC ON" : "SYNC"; clicked => { root.sync(); } }
+                Rectangle { horizontal-stretch: 1; }
+                VuMeter { level: root.meter; accent: root.accent; width: 10px; height: 26px; }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: "PITCH"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
                 Slider {
-                    minimum: -8.0;
-                    maximum: 8.0;
-                    value: root.pitch-pct;
+                    minimum: -8.0; maximum: 8.0; value: root.pitch-pct;
                     changed(v) => { root.pitch-pct = v; root.pitch-changed(v); }
                 }
-                Text {
-                    text: root.pitch-text;
-                    color: #dbe4ee;
-                    font-size: 12px;
-                    width: 52px;
-                    horizontal-alignment: right;
-                    vertical-alignment: center;
-                }
+                Text { text: root.pitch-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             HorizontalLayout {
-                spacing: 8px;
-                Text {
-                    text: "GAIN";
-                    color: #6b7787;
-                    font-size: 11px;
-                    width: 42px;
-                    vertical-alignment: center;
-                }
+                spacing: 6px;
+                Text { text: "GAIN"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
                 Slider {
-                    minimum: 0.0;
-                    maximum: 1.5;
-                    value: root.gain;
+                    minimum: 0.0; maximum: 1.5; value: root.gain;
                     changed(v) => { root.gain = v; root.gain-changed(v); }
                 }
-                Text {
-                    text: root.gain-text;
-                    color: #dbe4ee;
-                    font-size: 12px;
-                    width: 52px;
-                    horizontal-alignment: right;
-                    vertical-alignment: center;
-                }
+                Text { text: root.gain-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
             }
+
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: "LOW"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
+                Slider {
+                    minimum: -12.0; maximum: 12.0; value: root.eq-low;
+                    changed(v) => { root.eq-low = v; root.eq-low-changed(v); }
+                }
+                Text { text: root.low-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: "MID"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
+                Slider {
+                    minimum: -12.0; maximum: 12.0; value: root.eq-mid;
+                    changed(v) => { root.eq-mid = v; root.eq-mid-changed(v); }
+                }
+                Text { text: root.mid-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: "HIGH"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
+                Slider {
+                    minimum: -12.0; maximum: 12.0; value: root.eq-high;
+                    changed(v) => { root.eq-high = v; root.eq-high-changed(v); }
+                }
+                Text { text: root.high-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+        }
+    }
+
+    component MixerStrip inherits Rectangle {
+        in property <float> meter-a: 0.0;
+        in property <float> meter-b: 0.0;
+        in property <float> master: 0.0;
+        in-out property <float> xf: 0.5;
+        callback xf-changed(float);
+
+        background: #0f1419;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: #1f2833;
+
+        VerticalLayout {
+            padding: 12px;
+            spacing: 10px;
+
+            Text { text: "MIXER"; color: #66727f; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+
+            HorizontalLayout {
+                spacing: 14px;
+                alignment: center;
+                vertical-stretch: 1;
+                VuMeter { level: root.meter-a; accent: #22d3ee; }
+                VuMeter { level: root.meter-b; accent: #fbbf24; }
+                VuMeter { level: root.master; accent: #9aa7b6; }
+            }
+
+            Text { text: "A · B · MASTER"; color: #4b5663; font-size: 9px; horizontal-alignment: center; }
+
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: "A"; color: #22d3ee; font-size: 12px; font-weight: 800; vertical-alignment: center; }
+                Slider {
+                    minimum: 0.0; maximum: 1.0; value: root.xf;
+                    changed(v) => { root.xf = v; root.xf-changed(v); }
+                }
+                Text { text: "B"; color: #fbbf24; font-size: 12px; font-weight: 800; vertical-alignment: center; }
+            }
+
+            Text { text: "CROSSFADER"; color: #4b5663; font-size: 9px; horizontal-alignment: center; }
         }
     }
 
     export component AppWindow inherits Window {
         title: "djdeck";
-        width: 1200px;
-        height: 640px;
-        background: #0b0f14;
+        width: 1240px;
+        height: 780px;
+        background: #0a0e13;
 
         in-out property <string> name-a: "sin cargar";
         in-out property <string> name-b: "sin cargar";
         in-out property <string> bpm-a: "—";
         in-out property <string> bpm-b: "—";
-        in-out property <string> pitch-a-text: "0.0%";
-        in-out property <string> pitch-b-text: "0.0%";
-        in-out property <string> gain-a-text: "80%";
-        in-out property <string> gain-b-text: "80%";
         in-out property <string> time-a: "0:00";
         in-out property <string> time-b: "0:00";
+        in-out property <string> pitch-a-text: "+0.0%";
+        in-out property <string> pitch-b-text: "+0.0%";
+        in-out property <string> gain-a-text: "80%";
+        in-out property <string> gain-b-text: "80%";
+        in-out property <string> low-a-text: "0.0 dB";
+        in-out property <string> low-b-text: "0.0 dB";
+        in-out property <string> mid-a-text: "0.0 dB";
+        in-out property <string> mid-b-text: "0.0 dB";
+        in-out property <string> high-a-text: "0.0 dB";
+        in-out property <string> high-b-text: "0.0 dB";
         in-out property <bool> playing-a: false;
         in-out property <bool> playing-b: false;
         in-out property <bool> synced-a: false;
         in-out property <bool> synced-b: false;
-        in-out property <float> head-a: 0.0;
-        in-out property <float> head-b: 0.0;
         in-out property <float> meter-a: 0.0;
         in-out property <float> meter-b: 0.0;
+        in-out property <float> meter-master: 0.0;
         in-out property <float> pitch-a: 0.0;
         in-out property <float> pitch-b: 0.0;
         in-out property <float> gain-a: 0.8;
         in-out property <float> gain-b: 0.8;
+        in-out property <float> eq-low-a: 0.0;
+        in-out property <float> eq-low-b: 0.0;
+        in-out property <float> eq-mid-a: 0.0;
+        in-out property <float> eq-mid-b: 0.0;
+        in-out property <float> eq-high-a: 0.0;
+        in-out property <float> eq-high-b: 0.0;
         in-out property <float> xf: 0.5;
         in-out property <image> wave-a;
         in-out property <image> wave-b;
+        in-out property <string> zoom-text: "8 s";
         in-out property <string> status: "";
 
         callback play-a();
@@ -227,96 +280,154 @@ slint::slint! {
         callback pitch-b-changed(float);
         callback gain-a-changed(float);
         callback gain-b-changed(float);
+        callback eq-low-a-changed(float);
+        callback eq-low-b-changed(float);
+        callback eq-mid-a-changed(float);
+        callback eq-mid-b-changed(float);
+        callback eq-high-a-changed(float);
+        callback eq-high-b-changed(float);
         callback xf-changed(float);
+        callback zoom-in();
+        callback zoom-out();
 
         VerticalLayout {
-            padding: 16px;
-            spacing: 14px;
+            padding: 12px;
+            spacing: 10px;
+
+            Rectangle {
+                vertical-stretch: 1;
+                background: #0c1116;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: #1a222c;
+
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 6px;
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: "ZOOM"; color: #4b5663; font-size: 9px; vertical-alignment: center; }
+                        Button { text: "−"; clicked => { root.zoom-out(); } }
+                        Text { text: root.zoom-text; color: #9aa7b6; font-size: 11px; width: 44px; horizontal-alignment: center; vertical-alignment: center; }
+                        Button { text: "+"; clicked => { root.zoom-in(); } }
+                    }
+
+                    Lane {
+                        label: "A";
+                        accent: #22d3ee;
+                        vertical-stretch: 1;
+                        track-name: root.name-a;
+                        bpm-text: root.bpm-a;
+                        time-text: root.time-a;
+                        synced: root.synced-a;
+                        img: root.wave-a;
+                    }
+
+                    Lane {
+                        label: "B";
+                        accent: #fbbf24;
+                        vertical-stretch: 1;
+                        track-name: root.name-b;
+                        bpm-text: root.bpm-b;
+                        time-text: root.time-b;
+                        synced: root.synced-b;
+                        img: root.wave-b;
+                    }
+                }
+            }
 
             HorizontalLayout {
-                spacing: 14px;
+                spacing: 10px;
 
-                Deck {
+                DeckPanel {
+                    width: 35%;
                     label: "A";
                     accent: #22d3ee;
-                    vertical-stretch: 1;
                     track-name: root.name-a;
                     bpm-text: root.bpm-a;
                     pitch-text: root.pitch-a-text;
                     gain-text: root.gain-a-text;
-                    time-text: root.time-a;
+                    low-text: root.low-a-text;
+                    mid-text: root.mid-a-text;
+                    high-text: root.high-a-text;
                     playing: root.playing-a;
                     synced: root.synced-a;
-                    head: root.head-a;
                     meter: root.meter-a;
                     pitch-pct: root.pitch-a;
                     gain: root.gain-a;
-                    wave: root.wave-a;
+                    eq-low: root.eq-low-a;
+                    eq-mid: root.eq-mid-a;
+                    eq-high: root.eq-high-a;
                     play => { root.play-a(); }
                     cue => { root.cue-a(); }
                     sync => { root.sync-a(); }
                     pitch-changed(v) => { root.pitch-a = v; root.pitch-a-changed(v); }
                     gain-changed(v) => { root.gain-a = v; root.gain-a-changed(v); }
+                    eq-low-changed(v) => { root.eq-low-a = v; root.eq-low-a-changed(v); }
+                    eq-mid-changed(v) => { root.eq-mid-a = v; root.eq-mid-a-changed(v); }
+                    eq-high-changed(v) => { root.eq-high-a = v; root.eq-high-a-changed(v); }
                 }
 
-                Deck {
+                MixerStrip {
+                    width: 26%;
+                    meter-a: root.meter-a;
+                    meter-b: root.meter-b;
+                    master: root.meter-master;
+                    xf: root.xf;
+                    xf-changed(v) => { root.xf = v; root.xf-changed(v); }
+                }
+
+                DeckPanel {
+                    width: 35%;
                     label: "B";
                     accent: #fbbf24;
-                    vertical-stretch: 1;
                     track-name: root.name-b;
                     bpm-text: root.bpm-b;
                     pitch-text: root.pitch-b-text;
                     gain-text: root.gain-b-text;
-                    time-text: root.time-b;
+                    low-text: root.low-b-text;
+                    mid-text: root.mid-b-text;
+                    high-text: root.high-b-text;
                     playing: root.playing-b;
                     synced: root.synced-b;
-                    head: root.head-b;
                     meter: root.meter-b;
                     pitch-pct: root.pitch-b;
                     gain: root.gain-b;
-                    wave: root.wave-b;
+                    eq-low: root.eq-low-b;
+                    eq-mid: root.eq-mid-b;
+                    eq-high: root.eq-high-b;
                     play => { root.play-b(); }
                     cue => { root.cue-b(); }
                     sync => { root.sync-b(); }
                     pitch-changed(v) => { root.pitch-b = v; root.pitch-b-changed(v); }
                     gain-changed(v) => { root.gain-b = v; root.gain-b-changed(v); }
+                    eq-low-changed(v) => { root.eq-low-b = v; root.eq-low-b-changed(v); }
+                    eq-mid-changed(v) => { root.eq-mid-b = v; root.eq-mid-b-changed(v); }
+                    eq-high-changed(v) => { root.eq-high-b = v; root.eq-high-b-changed(v); }
                 }
-            }
-
-            HorizontalLayout {
-                alignment: center;
-                spacing: 14px;
-                Text { text: "A"; color: #22d3ee; font-size: 16px; font-weight: 800; vertical-alignment: center; }
-                Slider {
-                    width: 55%;
-                    minimum: 0.0;
-                    maximum: 1.0;
-                    value: root.xf;
-                    changed(v) => { root.xf = v; root.xf-changed(v); }
-                }
-                Text { text: "B"; color: #fbbf24; font-size: 16px; font-weight: 800; vertical-alignment: center; }
             }
 
             Text {
                 text: root.status;
-                color: #6b7787;
-                font-size: 12px;
+                color: #55606d;
+                font-size: 10px;
                 horizontal-alignment: center;
             }
         }
     }
 }
 
-/// 1024 frames ≈ 21 ms de buffer: medido estable en PipeWire (256 frames produce
-/// underruns sostenidos y el reloj de audio se atrasa ~16 %). Se puede forzar con
-/// `DJDECK_FRAMES`.
-const DEFAULT_FRAMES: u32 = 1024;
-
-/// Estado de la UI que no vive en los controles atómicos.
 struct DeckState {
     track: Option<Arc<Track>>,
+    pyramid: Option<PeakPyramid>,
     syncing: bool,
     pitch_pct: f64,
+}
+
+struct ViewState {
+    zoom_secs: f64,
 }
 
 fn main() -> Result<()> {
@@ -325,13 +436,8 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--selftest") {
         return run_selftest();
     }
-
     if let Some(arg) = args.iter().find(|a| a.starts_with("--autoplay")) {
-        let secs: u64 = arg
-            .split('=')
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10);
+        let secs: u64 = arg.split('=').nth(1).and_then(|s| s.parse().ok()).unwrap_or(10);
         return run_device_test(secs);
     }
 
@@ -349,25 +455,27 @@ fn main() -> Result<()> {
     let decks = Rc::new(RefCell::new([
         DeckState {
             track: None,
+            pyramid: None,
             syncing: false,
             pitch_pct: 0.0,
         },
         DeckState {
             track: None,
+            pyramid: None,
             syncing: false,
             pitch_pct: 0.0,
         },
     ]));
+    let view = Rc::new(RefCell::new(ViewState { zoom_secs: 8.0 }));
 
     let ui = AppWindow::new()?;
 
-    // Carga inicial: archivos de la CLI o dos demos sintéticos.
+    // ---- carga inicial ----
     let mut loaded: [Option<Arc<Track>>; DECK_COUNT] = [None, None];
     if args.is_empty() {
         for i in 0..DECK_COUNT {
             let bpm = if i == 0 { 127.4 } else { 128.0 };
-            let t = Arc::new(make_demo_track(bpm, sr, if i == 0 { -3.0 } else { 0.0 }));
-            loaded[i] = Some(t);
+            loaded[i] = Some(Arc::new(make_demo_track(bpm, sr, if i == 0 { -3.0 } else { 0.0 })));
         }
         println!("sin archivos: uso dos demos sintéticos (127.4 y 128.0 BPM)");
     } else {
@@ -379,34 +487,36 @@ fn main() -> Result<()> {
             let (bpm, first) = analysis::detect_bpm(&samples, sr)
                 .ok_or_else(|| anyhow::anyhow!("no se pudo detectar el BPM de {path}"))?;
             let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
-            let track = Track::new(name, samples, sr, BeatGrid::new(bpm, first));
             println!("{bpm:.1} BPM, primer beat {first:.3}s");
-            loaded[i] = Some(Arc::new(track));
+            loaded[i] = Some(Arc::new(Track::new(
+                name,
+                samples,
+                sr,
+                BeatGrid::new(bpm, first),
+            )));
         }
     }
 
     for i in 0..DECK_COUNT {
         if let Some(track) = loaded[i].clone() {
-            let peaks = analysis::peaks(&track.samples, 900);
-            let grid = track.grid;
-            let name = track.name.clone();
+            let pyramid = PeakPyramid::build(&track.samples, &[32, 128, 512, 2048, 8192, 32768]);
             pending.lock().unwrap().push((i, track.clone()));
-            decks.borrow_mut()[i].track = Some(track);
-
-            let wave = wave_image(&peaks, 900, 104, accent(i));
+            {
+                let mut st = decks.borrow_mut();
+                st[i].track = Some(track.clone());
+                st[i].pyramid = Some(pyramid);
+            }
             if i == 0 {
-                ui.set_wave_a(wave);
-                ui.set_name_a(name.into());
-                ui.set_bpm_a(format!("{:.1} BPM", grid.bpm).into());
+                ui.set_name_a(track.name.clone().into());
+                ui.set_bpm_a(format!("{:.1} BPM", track.grid.bpm).into());
             } else {
-                ui.set_wave_b(wave);
-                ui.set_name_b(name.into());
-                ui.set_bpm_b(format!("{:.1} BPM", grid.bpm).into());
+                ui.set_name_b(track.name.clone().into());
+                ui.set_bpm_b(format!("{:.1} BPM", track.grid.bpm).into());
             }
         }
     }
 
-    // ---- callbacks de UI ----
+    // ---- callbacks ----
     {
         let controls = controls.clone();
         ui.on_play_a(move || toggle_play(&controls, 0));
@@ -455,35 +565,94 @@ fn main() -> Result<()> {
     }
     {
         let controls = controls.clone();
+        ui.on_eq_low_a_changed(move |v| engine::set_f32(&controls.eq_low[0], v));
+    }
+    {
+        let controls = controls.clone();
+        ui.on_eq_low_b_changed(move |v| engine::set_f32(&controls.eq_low[1], v));
+    }
+    {
+        let controls = controls.clone();
+        ui.on_eq_mid_a_changed(move |v| engine::set_f32(&controls.eq_mid[0], v));
+    }
+    {
+        let controls = controls.clone();
+        ui.on_eq_mid_b_changed(move |v| engine::set_f32(&controls.eq_mid[1], v));
+    }
+    {
+        let controls = controls.clone();
+        ui.on_eq_high_a_changed(move |v| engine::set_f32(&controls.eq_high[0], v));
+    }
+    {
+        let controls = controls.clone();
+        ui.on_eq_high_b_changed(move |v| engine::set_f32(&controls.eq_high[1], v));
+    }
+    {
+        let controls = controls.clone();
         ui.on_xf_changed(move |v| engine::set_f32(&controls.crossfader, v));
+    }
+    {
+        let view = view.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_zoom_in(move || {
+            let mut v = view.borrow_mut();
+            v.zoom_secs = (v.zoom_secs / 2.0).max(1.0);
+            let text = format!("{} s", v.zoom_secs);
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_zoom_text(text.into());
+            }
+        });
+    }
+    {
+        let view = view.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_zoom_out(move || {
+            let mut v = view.borrow_mut();
+            v.zoom_secs = (v.zoom_secs * 2.0).min(64.0);
+            let text = format!("{} s", v.zoom_secs);
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_zoom_text(text.into());
+            }
+        });
+    }
+
+    // DJDECK_PLAY=1 arranca los dos decks y el sync de B contra A: sirve para
+    // mirar la alineación de las ondas sin tocar el mouse.
+    if std::env::var("DJDECK_PLAY").is_ok() {
+        controls.playing[0].store(true, Ordering::Relaxed);
+        controls.playing[1].store(true, Ordering::Relaxed);
+        decks.borrow_mut()[1].syncing = true;
+        ui.set_synced_b(true);
     }
 
     ui.set_gain_a(engine::get_f32(&controls.gain[0]));
     ui.set_gain_b(engine::get_f32(&controls.gain[1]));
     ui.set_xf(engine::get_f32(&controls.crossfader));
+    ui.set_zoom_text(format!("{} s", view.borrow().zoom_secs).into());
     ui.set_status(
         format!(
-            "{} Hz · {} frames ({:.1} ms de buffer) · SYNC alinea tempo y fase contra el otro deck",
+            "{} Hz · {} frames ({:.1} ms) · ondas apiladas con rejilla · EQ real de 3 bandas",
             sr, out.buffer_frames, latency_ms
         )
         .into(),
     );
 
-    // ---- refresco a 20 Hz: posiciones, medidores y lazo de sync ----
+    // ---- refresco ~30 Hz: sync, ondas, medidores, pitch efectivo ----
     {
         let controls = controls.clone();
         let decks = decks.clone();
+        let view = view.clone();
         let ui_weak = ui.as_weak();
-        let sr = sr as f64;
+        let sr_f = sr as f64;
         let timer = Timer::default();
-        timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
+        timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = ui_weak.upgrade() else { return };
 
             let pos: Vec<f64> = (0..DECK_COUNT)
-                .map(|i| controls.position[i].load(Ordering::Relaxed) as f64 / sr)
+                .map(|i| controls.position[i].load(Ordering::Relaxed) as f64 / sr_f)
                 .collect();
             let len: Vec<f64> = (0..DECK_COUNT)
-                .map(|i| controls.length[i].load(Ordering::Relaxed) as f64 / sr)
+                .map(|i| controls.length[i].load(Ordering::Relaxed) as f64 / sr_f)
                 .collect();
 
             // Lazo de sync: el deck sincronizado sigue al otro.
@@ -504,30 +673,96 @@ fn main() -> Result<()> {
                 }
             }
 
+            // Pitch efectivo: con sync activo el fader sigue al lazo.
+            for i in 0..DECK_COUNT {
+                let rate = engine::get_f32(&controls.rate[i]) as f64;
+                let pct = (rate - 1.0) * 100.0;
+                let (syncing, grid_bpm) = {
+                    let mut st = decks.borrow_mut();
+                    st[i].pitch_pct = pct;
+                    (
+                        st[i].syncing,
+                        st[i].track.as_ref().map(|t| t.grid.bpm).unwrap_or(0.0),
+                    )
+                };
+                let text = if syncing {
+                    format!("SYNC {:+.1}%", pct)
+                } else {
+                    format!("{:+.1}%", pct)
+                };
+                let bpm_text = if grid_bpm > 0.0 {
+                    if syncing {
+                        format!("{:.1} → {:.1}", grid_bpm, grid_bpm * rate)
+                    } else {
+                        format!("{:.1} BPM", grid_bpm)
+                    }
+                } else {
+                    "—".to_string()
+                };
+                if i == 0 {
+                    ui.set_pitch_a_text(text.into());
+                    ui.set_pitch_a(pct as f32);
+                    ui.set_bpm_a(bpm_text.into());
+                } else {
+                    ui.set_pitch_b_text(text.into());
+                    ui.set_pitch_b(pct as f32);
+                    ui.set_bpm_b(bpm_text.into());
+                }
+            }
+
+            // Ondas apiladas: cada lane centrada en la posición de su deck.
+            let zoom = view.borrow().zoom_secs;
+            let frames_per_px = zoom * sr_f / LANE_W as f64;
+            let (rate_a, rate_b) = (
+                engine::get_f32(&controls.rate[0]) as f64,
+                engine::get_f32(&controls.rate[1]) as f64,
+            );
+            let img_a = {
+                let st = decks.borrow();
+                st[0].pyramid.as_ref().map(|p| {
+                    render_lane(
+                        p,
+                        pos[0] * sr_f,
+                        frames_per_px,
+                        rate_a,
+                        (34, 211, 238),
+                        st[0].track.as_ref().map(|t| t.grid),
+                        sr_f,
+                    )
+                })
+            };
+            if let Some(img) = img_a {
+                ui.set_wave_a(img);
+            }
+            let img_b = {
+                let st = decks.borrow();
+                st[1].pyramid.as_ref().map(|p| {
+                    render_lane(
+                        p,
+                        pos[1] * sr_f,
+                        frames_per_px,
+                        rate_b,
+                        (251, 191, 36),
+                        st[1].track.as_ref().map(|t| t.grid),
+                        sr_f,
+                    )
+                })
+            };
+            if let Some(img) = img_b {
+                ui.set_wave_b(img);
+            }
+
             let peaks = [
                 engine::get_f32(&controls.peak[0]),
                 engine::get_f32(&controls.peak[1]),
             ];
-            let playing = [
-                controls.playing[0].load(Ordering::Relaxed),
-                controls.playing[1].load(Ordering::Relaxed),
-            ];
-
-            ui.set_head_a(fraction(pos[0], len[0]) as f32);
-            ui.set_head_b(fraction(pos[1], len[1]) as f32);
+            ui.set_meter_a((peaks[0] * 5.0).min(1.0));
+            ui.set_meter_b((peaks[1] * 5.0).min(1.0));
+            ui.set_meter_master((engine::get_f32(&controls.master_peak) * 5.0).min(1.0));
+            ui.set_playing_a(controls.playing[0].load(Ordering::Relaxed));
+            ui.set_playing_b(controls.playing[1].load(Ordering::Relaxed));
             ui.set_time_a(fmt_time(pos[0], len[0]).into());
             ui.set_time_b(fmt_time(pos[1], len[1]).into());
-            ui.set_meter_a((peaks[0] * 6.0).min(1.0));
-            ui.set_meter_b((peaks[1] * 6.0).min(1.0));
-            ui.set_playing_a(playing[0]);
-            ui.set_playing_b(playing[1]);
-
-            let pitch = {
-                let st = decks.borrow();
-                [st[0].pitch_pct, st[1].pitch_pct]
-            };
-            ui.set_pitch_a_text(format!("{:+.1}%", pitch[0]).into());
-            ui.set_pitch_b_text(format!("{:+.1}%", pitch[1]).into());
 
             let gains = [
                 engine::get_f32(&controls.gain[0]),
@@ -535,6 +770,28 @@ fn main() -> Result<()> {
             ];
             ui.set_gain_a_text(format!("{:.0}%", gains[0] * 100.0).into());
             ui.set_gain_b_text(format!("{:.0}%", gains[1] * 100.0).into());
+
+            for i in 0..DECK_COUNT {
+                let (lo, mi, hi) = (
+                    engine::get_f32(&controls.eq_low[i]),
+                    engine::get_f32(&controls.eq_mid[i]),
+                    engine::get_f32(&controls.eq_high[i]),
+                );
+                let (a, b, c) = (
+                    format!("{:+.1} dB", lo),
+                    format!("{:+.1} dB", mi),
+                    format!("{:+.1} dB", hi),
+                );
+                if i == 0 {
+                    ui.set_low_a_text(a.into());
+                    ui.set_mid_a_text(b.into());
+                    ui.set_high_a_text(c.into());
+                } else {
+                    ui.set_low_b_text(a.into());
+                    ui.set_mid_b_text(b.into());
+                    ui.set_high_b_text(c.into());
+                }
+            }
         });
         std::mem::forget(timer); // vive lo que vive la app
     }
@@ -544,9 +801,179 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Verificación sin UI ni placa de sonido: dos demos, deck B sincronizado a A,
-/// 30 s de mezcla en bloques de 256 frames con lazo de control cada ~48 ms.
-/// Imprime el BPM detectado y el peor error de fase después de 5 s.
+fn toggle_play(controls: &Arc<Controls>, deck: usize) {
+    let cur = controls.playing[deck].load(Ordering::Relaxed);
+    controls.playing[deck].store(!cur, Ordering::Relaxed);
+}
+
+fn cue(controls: &Arc<Controls>, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize) {
+    let st = decks.borrow();
+    if let Some(track) = st[deck].track.as_ref() {
+        let frame = (track.grid.first_beat * track.sample_rate as f64) as u64;
+        controls.playing[deck].store(false, Ordering::Relaxed);
+        controls.seek_request[deck].store(frame, Ordering::Relaxed);
+    }
+}
+
+fn toggle_sync(decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, ui: &slint::Weak<AppWindow>, deck: usize) {
+    let mut st = decks.borrow_mut();
+    st[deck].syncing = !st[deck].syncing;
+    let on = st[deck].syncing;
+    drop(st);
+    if let Some(ui) = ui.upgrade() {
+        if deck == 0 {
+            ui.set_synced_a(on);
+        } else {
+            ui.set_synced_b(on);
+        }
+    }
+}
+
+fn set_pitch(controls: &Arc<Controls>, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize, pct: f32) {
+    {
+        let mut st = decks.borrow_mut();
+        st[deck].pitch_pct = pct as f64;
+        if st[deck].syncing {
+            return; // mientras está sincronizado manda el lazo de sync
+        }
+    }
+    engine::set_f32(&controls.rate[deck], 1.0 + pct / 100.0);
+}
+
+fn fmt_time(pos: f64, len: f64) -> String {
+    fn mmss(s: f64) -> String {
+        let s = s.max(0.0);
+        format!("{}:{:02}", (s / 60.0) as u64, (s % 60.0) as u64)
+    }
+    format!("{} / {}", mmss(pos), mmss(len))
+}
+
+/// Dibuja una lane: envolvente de picos, rejilla de beats y playhead al centro.
+/// Las dos lanes comparten eje de tiempo, así que con el sync enganchado los
+/// kicks caen en la misma vertical.
+fn render_lane(
+    pyr: &PeakPyramid,
+    center_frame: f64,
+    frames_per_px: f64,
+    rate: f64,
+    rgb: (u8, u8, u8),
+    grid: Option<BeatGrid>,
+    sr: f64,
+) -> Image {
+    let (w, h) = (LANE_W, LANE_H);
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
+    let mid_y = h as f32 / 2.0;
+    let mid_x = w as f32 / 2.0;
+    // Un píxel es tiempo de reproducción: el material avanza `rate` frames de
+    // fuente por frame de salida. Sin esto, dos temas sincronizados a BPM
+    // distintos muestran rejillas con espaciado distinto y el sync parece roto.
+    let src_per_px = frames_per_px * rate;
+    let half_win = mid_x as f64 * src_per_px;
+    let gain = 0.92 / pyr.norm;
+
+    {
+        let pixels = buf.make_mut_slice();
+        for p in pixels.iter_mut() {
+            *p = Rgba8Pixel {
+                r: 7,
+                g: 10,
+                b: 14,
+                a: 255,
+            };
+        }
+
+        if let Some(level) = pyr.level_for(src_per_px) {
+            let fpb = level.frames_per_bucket as f64;
+            let buckets = level.max.len();
+            for x in 0..w {
+                let frame = center_frame + (x as f64 - mid_x as f64) * src_per_px;
+                let b = (frame / fpb) as isize;
+                if b < 0 || b as usize >= buckets {
+                    continue;
+                }
+                let hi = level.max[b as usize] * gain;
+                let lo = level.min[b as usize] * gain;
+                let y0 = (mid_y - hi.clamp(0.0, 1.0) * mid_y).clamp(0.0, h as f32 - 1.0);
+                let y1 = (mid_y - lo.clamp(-1.0, 0.0) * mid_y).clamp(0.0, h as f32 - 1.0);
+                let (top, bot) = if y0 <= y1 {
+                    (y0 as u32, y1 as u32)
+                } else {
+                    (y1 as u32, y0 as u32)
+                };
+                for y in top..=bot {
+                    let dist = (y as f32 - mid_y).abs() / mid_y.max(1.0);
+                    let f = 1.0 - 0.5 * dist;
+                    let idx = (y * w + x) as usize;
+                    pixels[idx] = Rgba8Pixel {
+                        r: (rgb.0 as f32 * f) as u8,
+                        g: (rgb.1 as f32 * f) as u8,
+                        b: (rgb.2 as f32 * f) as u8,
+                        a: 255,
+                    };
+                }
+            }
+        }
+
+        // Rejilla: un tick por beat, más marcado cada 4.
+        if let Some(grid) = grid {
+            let beat_frames = grid.beat_len() * sr;
+            if beat_frames > 1.0 {
+                let first = grid.first_beat * sr;
+                let k0 = ((center_frame - half_win - first) / beat_frames).floor() as i64;
+                let k1 = ((center_frame + half_win - first) / beat_frames).ceil() as i64;
+                for k in k0..=k1 {
+                    if k < 0 {
+                        continue;
+                    }
+                    let beat_frame = first + k as f64 * beat_frames;
+                    let x = mid_x as f64 + (beat_frame - center_frame) / src_per_px;
+                    if x < 0.0 || x >= w as f64 - 1.0 {
+                        continue;
+                    }
+                    let is_bar = k % 4 == 0;
+                    let (alpha, thick) = if is_bar { (0.5f32, 2u32) } else { (0.18, 1) };
+                    for dx in 0..thick {
+                        let xi = x as u32 + dx;
+                        if xi >= w {
+                            continue;
+                        }
+                        for y in 0..h {
+                            let idx = (y * w + xi) as usize;
+                            let p = pixels[idx];
+                            pixels[idx] = Rgba8Pixel {
+                                r: (p.r as f32 * (1.0 - alpha) + 255.0 * alpha * 0.55) as u8,
+                                g: (p.g as f32 * (1.0 - alpha) + 255.0 * alpha * 0.75) as u8,
+                                b: (p.b as f32 * (1.0 - alpha) + 255.0 * alpha) as u8,
+                                a: 255,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Playhead al centro: la referencia vertical de las dos lanes.
+        for dx in 0..2u32 {
+            let x = (mid_x as u32).saturating_sub(1) + dx;
+            if x >= w {
+                continue;
+            }
+            for y in 0..h {
+                let idx = (y * w + x) as usize;
+                pixels[idx] = Rgba8Pixel {
+                    r: 240,
+                    g: 245,
+                    b: 250,
+                    a: 255,
+                };
+            }
+        }
+    }
+
+    Image::from_rgba8(buf)
+}
+
+/// Verificación sin UI ni placa de sonido: dos demos, deck B sincronizado a A.
 fn run_selftest() -> Result<()> {
     let sr = 48_000u32;
     let controls = Arc::new(Controls::default());
@@ -555,9 +982,8 @@ fn run_selftest() -> Result<()> {
 
     let a = Arc::new(make_demo_track(127.4, sr, -3.0));
     let b = Arc::new(make_demo_track(128.0, sr, 0.0));
-    let (grid_a, grid_b) = (a.grid, b.grid);
-    let grid_a = BeatGrid::new(grid_a.bpm, 0.0);
-    let grid_b = BeatGrid::new(grid_b.bpm, 0.0);
+    let grid_a = BeatGrid::new(a.grid.bpm, 0.0);
+    let grid_b = BeatGrid::new(b.grid.bpm, 0.0);
 
     for (name, track) in [("A", &a), ("B", &b)] {
         let (bpm, first) = analysis::detect_bpm(&track.samples, sr).unwrap_or((0.0, 0.0));
@@ -577,7 +1003,7 @@ fn run_selftest() -> Result<()> {
     controls.playing[1].store(true, Ordering::Relaxed);
 
     const BLOCK: usize = 256;
-    let blocks_per_tick = 9; // 9 * 256 / 48000 ≈ 48 ms
+    let blocks_per_tick = 9;
     let mut peak = 0.0f32;
     let mut worst_after_5s = 0.0f64;
     let mut final_err = 0.0f64;
@@ -628,25 +1054,21 @@ fn run_selftest() -> Result<()> {
     }
 }
 
-/// Verificación de punta a punta con la placa real, sin UI: abre el dispositivo,
-/// pone los dos demos a sonar, sincroniza B contra A y reporta pico, posiciones
-/// y xruns. Sirve para saber si el camino de audio vive o no.
+/// Verificación de punta a punta con la placa real, sin UI.
 fn run_device_test(secs: u64) -> Result<()> {
     let controls = Arc::new(Controls::default());
     let pending: PendingLoads = Arc::new(Mutex::new(Vec::new()));
     let out = engine::output::start(controls.clone(), pending.clone(), DEFAULT_FRAMES)?;
     let sr = out.sample_rate;
-    println!(
-        "autoplay: {} | {} Hz | buffer del backend | pedido 0 frames",
-        out.device_name, sr
-    );
+    println!("autoplay: {} | {} Hz | {} frames", out.device_name, sr, out.buffer_frames);
+
     let a = Arc::new(make_demo_track(127.4, sr, -3.0));
     let b = Arc::new(make_demo_track(128.0, sr, 0.0));
     let (grid_a, grid_b) = (a.grid, b.grid);
     pending.lock().unwrap().push((0, a));
     pending.lock().unwrap().push((1, b));
 
-    std::thread::sleep(Duration::from_millis(300)); // que el callback cargue los tracks
+    std::thread::sleep(Duration::from_millis(300));
 
     engine::set_f32(&controls.gain[0], 1.0);
     engine::set_f32(&controls.gain[1], 1.0);
@@ -694,18 +1116,12 @@ fn run_device_test(secs: u64) -> Result<()> {
         secs * 20,
         xruns
     );
-    let block = controls.block_frames_max.load(Ordering::Relaxed);
     println!(
-        "autoplay: bloque máximo del callback {} frames ({:.1} ms), último {}",
-        block,
-        block as f64 * 1000.0 / sr_f,
-        controls.block_frames_last.load(Ordering::Relaxed)
-    );
-    println!(
-        "autoplay: posiciones A={} B={} frames ({:.2} s de audio)",
+        "autoplay: posiciones A={} B={} frames ({:.2} s de audio) | bloque máximo {} frames",
         pos_a,
         pos_b,
-        pos_b as f64 / sr_f
+        pos_b as f64 / sr_f,
+        controls.block_frames_max.load(Ordering::Relaxed)
     );
 
     let mut ok = true;
@@ -728,128 +1144,19 @@ fn run_device_test(secs: u64) -> Result<()> {
     }
 }
 
-fn accent(deck: usize) -> (u8, u8, u8) {
-    if deck == 0 {
-        (34, 211, 238)
-    } else {
-        (251, 191, 36)
-    }
-}
-
-fn toggle_play(controls: &Arc<Controls>, deck: usize) {
-    let cur = controls.playing[deck].load(Ordering::Relaxed);
-    controls.playing[deck].store(!cur, Ordering::Relaxed);
-}
-
-fn cue(controls: &Arc<Controls>, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize) {
-    let st = decks.borrow();
-    if let Some(track) = st[deck].track.as_ref() {
-        let frame = (track.grid.first_beat * track.sample_rate as f64) as u64;
-        controls.playing[deck].store(false, Ordering::Relaxed);
-        controls.seek_request[deck].store(frame, Ordering::Relaxed);
-    }
-}
-
-fn toggle_sync(decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, ui: &slint::Weak<AppWindow>, deck: usize) {
-    let mut st = decks.borrow_mut();
-    st[deck].syncing = !st[deck].syncing;
-    let on = st[deck].syncing;
-    drop(st);
-    if let Some(ui) = ui.upgrade() {
-        if deck == 0 {
-            ui.set_synced_a(on);
-        } else {
-            ui.set_synced_b(on);
-        }
-    }
-}
-
-fn set_pitch(controls: &Arc<Controls>, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize, pct: f32) {
-    {
-        let mut st = decks.borrow_mut();
-        st[deck].pitch_pct = pct as f64;
-        if st[deck].syncing {
-            return; // sync manda: el pitch manual queda ignorado mientras esté activo
-        }
-    }
-    engine::set_f32(&controls.rate[deck], 1.0 + pct / 100.0);
-}
-
-fn fraction(pos: f64, len: f64) -> f64 {
-    if len <= 0.0 {
-        0.0
-    } else {
-        (pos / len).clamp(0.0, 1.0)
-    }
-}
-
-fn fmt_time(pos: f64, len: f64) -> String {
-    fn mmss(s: f64) -> String {
-        let s = s.max(0.0);
-        format!("{}:{:02}", (s / 60.0) as u64, (s % 60.0) as u64)
-    }
-    format!("{} / {}", mmss(pos), mmss(len))
-}
-
-/// Dibuja la waveform a partir de los picos: una barra vertical por columna.
-fn wave_image(peaks: &Peaks, w: u32, h: u32, rgb: (u8, u8, u8)) -> Image {
-    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
-    {
-        let pixels = buf.make_mut_slice();
-        for p in pixels.iter_mut() {
-            *p = Rgba8Pixel {
-                r: 8,
-                g: 11,
-                b: 15,
-                a: 255,
-            };
-        }
-        let buckets = peaks.max.len().max(1);
-        let mid = h as f32 / 2.0;
-        // Normaliza al pico del track: un master muy comprimido no debe tocar
-        // los bordes del panel como si estuviera recortado.
-        let peak_amp = (0..buckets)
-            .map(|b| peaks.max[b].abs().max(peaks.min[b].abs()))
-            .fold(0.0f32, f32::max)
-            .max(0.05);
-        let norm = 0.92 / peak_amp;
-        for x in 0..w {
-            let b = (x as usize * buckets / w as usize).min(buckets - 1);
-            let amp = (peaks.max[b].abs().max(peaks.min[b].abs()) * norm).clamp(0.02, 1.0);
-            let half = (amp * mid).max(0.5);
-            let y0 = (mid - half).max(0.0) as u32;
-            let y1 = ((mid + half) as u32).min(h - 1);
-            for y in y0..=y1 {
-                let idx = (y * w + x) as usize;
-                let dist = (y as f32 - mid).abs() / mid.max(1.0);
-                let f = 1.0 - 0.45 * dist;
-                pixels[idx] = Rgba8Pixel {
-                    r: (rgb.0 as f32 * f) as u8,
-                    g: (rgb.1 as f32 * f) as u8,
-                    b: (rgb.2 as f32 * f) as u8,
-                    a: 255,
-                };
-            }
-        }
-    }
-    Image::from_rgba8(buf)
-}
-
-/// Track sintético: kick en cada beat, hat en la corchea, bajo y acorde.
-/// Sirve para probar el motor y el sync sin depender de archivos.
+/// Track sintético: kick en cada beat, hat en la corchea y bajo.
 fn make_demo_track(bpm: f64, sr: u32, detune_semitones: f64) -> Track {
     let seconds = 32.0;
     let frames = (seconds * sr as f64) as usize;
     let mut samples = vec![0.0f32; frames * 2];
     let beat = 60.0 / bpm;
-    let root = 55.0 * 2f64.powf(detune_semitones / 12.0); // A1
+    let root = 55.0 * 2f64.powf(detune_semitones / 12.0);
 
     let mut t = 0.0;
     let mut beat_idx = 0usize;
     while t < seconds {
         let start = (t * sr as f64) as usize;
 
-        // Kick: barrido 110 -> 45 Hz con caída rápida.
         let kick_len = (sr as f64 * 0.18) as usize;
         for i in 0..kick_len {
             let idx = start + i;
@@ -864,7 +1171,6 @@ fn make_demo_track(bpm: f64, sr: u32, detune_semitones: f64) -> Track {
             samples[idx * 2 + 1] += v;
         }
 
-        // Hat en la corchea: ruido corto.
         let hat_start = start + (beat * 0.5 * sr as f64) as usize;
         let hat_len = (sr as f64 * 0.04) as usize;
         let mut seed = 12345u32.wrapping_add(beat_idx as u32 * 7919);
@@ -881,7 +1187,6 @@ fn make_demo_track(bpm: f64, sr: u32, detune_semitones: f64) -> Track {
             samples[idx * 2 + 1] += v;
         }
 
-        // Bajo en cada beat: nota del patrón.
         let pattern = [0, 0, 7, 5];
         let semis = pattern[beat_idx % pattern.len()] as f64;
         let f = root * 2f64.powf(semis / 12.0);
