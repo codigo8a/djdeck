@@ -8,3 +8,4 @@ license.workspace = true
 symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "wav", "isomp4", "alac", "ogg", "vorbis"] }
 cpal = "0.15"
 anyhow = "1"
+libc = "0.2"

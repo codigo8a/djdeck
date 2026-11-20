@@ -63,6 +63,13 @@ crates/
   app/       UI Slint + lazo de control (20 Hz) + demos sintéticos
 ```
 
+**El audio corre en su propio proceso.** La UI lanza `djdeck --audio-engine`, que abre el
+dispositivo y mezcla; los dos se hablan por `engine::shm` (un archivo mapeado en
+`$XDG_RUNTIME_DIR/djdeck-shm` con los mismos atómicos de `Controls` y una cola de cargas por deck).
+Motivo medido: si la UI y el hilo de audio comparten proceso, el repintado de la ventana hace que el
+cliente entregue bloques tarde y PipeWire los descarta — 98 % de frames renderizados y chispeo
+audible; con el motor aparte, 99.9-99.98 %.
+
 Reglas que no se rompen:
 
 1. El callback de audio sólo lee controles atómicos y hace sumas y multiplicaciones.

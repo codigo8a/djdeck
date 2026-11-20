@@ -79,10 +79,12 @@ fn dos_decks_identicos_suman_con_la_curva() {
     h.controls.playing[0].store(true, Ordering::Relaxed);
     h.controls.playing[1].store(true, Ordering::Relaxed);
 
+    let _ = h.render(480); // completa el fade-in de 5 ms al dar play
     let out = h.render(256);
     let (g, _) = equal_power(0.5);
     for i in 0..256 {
-        let expected = (i as f32 * 2.0 * std::f32::consts::PI * freq / SR as f32).sin() * amp * 2.0 * g;
+        let frame = 480 + i;
+        let expected = (frame as f32 * 2.0 * std::f32::consts::PI * freq / SR as f32).sin() * amp * 2.0 * g;
         assert!(
             (out[i * 2] - expected).abs() < 1e-5,
             "frame {i}: {} vs {expected}",
@@ -104,10 +106,12 @@ fn separacion_de_canales_y_mute_por_gain() {
     h.controls.playing[0].store(true, Ordering::Relaxed);
     h.controls.playing[1].store(true, Ordering::Relaxed);
 
+    let _ = h.render(480); // completa el fade-in de 5 ms al dar play
     let out = h.render(128);
     let (g, _) = equal_power(0.5);
     for i in 0..128 {
-        let expected = (i as f32 * 2.0 * std::f32::consts::PI * 500.0 / SR as f32).sin() * 0.5 * g;
+        let frame = 480 + i;
+        let expected = (frame as f32 * 2.0 * std::f32::consts::PI * 500.0 / SR as f32).sin() * 0.5 * g;
         assert!((out[i * 2] - expected).abs() < 1e-5);
         assert!((out[i * 2 + 1] - expected).abs() < 1e-5);
     }
@@ -116,7 +120,7 @@ fn separacion_de_canales_y_mute_por_gain() {
     engine::set_f32(&h.controls.gain[0], 0.0);
     let out = h.render(128);
     for i in 0..128 {
-        let frame = 128 + i; // el bloque anterior ya consumió 128 frames
+        let frame = 608 + i; // los dos bloques anteriores ya consumieron 608 frames
         let expected = (frame as f32 * 2.0 * std::f32::consts::PI * 500.0 / SR as f32).sin() * 0.5 * g;
         assert!((out[i * 2 + 1] - expected).abs() < 1e-5, "R debe seguir sonando");
         assert!(out[i * 2].abs() < 1e-6, "L debe estar muteado");

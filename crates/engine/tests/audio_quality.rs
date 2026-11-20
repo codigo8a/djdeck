@@ -213,15 +213,60 @@ fn describe(y: &[f32], fundamental: f64) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn pausar_no_corta_en_seco() {
+    // CUE hace playing = false + seek en la misma operación. Un corte en seco
+    // deja un escalón del tamaño de la muestra instantánea: suena a click y
+    // excita la etapa analógica, que queda chispeando un instante. Se exige que
+    // el corte se rampee (~5 ms): el salto máximo entre muestras consecutivas
+    // tiene que quedar cerca del slew natural de la señal, no del nivel.
+    let controls = Arc::new(Controls::default());
+    set_f32(&controls.master_gain, 1.0);
+    set_f32(&controls.crossfader, 0.0);
+    let pending: PendingLoads = Arc::new(Mutex::new(Vec::new()));
+    pending.lock().unwrap().push((
+        0,
+        Arc::new(Track::new(
+            "test",
+            sine(100.0, SOURCE_FRAMES, 0.9, SR as f64),
+            SR,
+            BeatGrid::new(120.0, 0.0),
+        )),
+    ));
+    let mut mixer = Mixer::new(controls.clone(), pending.clone(), SR);
+    let mut warm = vec![0.0f32; 256 * 2];
+    mixer.render(&mut warm);
+    set_f32(&controls.gain[0], 1.0);
+    controls.playing[0].store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let mut out = mixer.render_to_vec(4_000);
+    // CUE: pausa + seek al primer beat, en pleno seno de 0.9.
+    controls.playing[0].store(false, std::sync::atomic::Ordering::Relaxed);
+    controls.seek_request[0].store(0, std::sync::atomic::Ordering::Relaxed);
+    out.extend(mixer.render_to_vec(4_000));
+
+    let mut peor = 0.0f32;
+    for i in 1..out.len() / 2 {
+        peor = peor.max((out[i * 2] - out[(i - 1) * 2]).abs());
+    }
+    // Slew natural de un seno de 100 Hz a 0.9: 0.012. Un corte en seco da ~0.9.
+    assert!(
+        peor < 0.05,
+        "el corte al pausar deja un escalón de {peor:.3} (sin fade suena a click)"
+    );
+}
+
+#[test]
 fn pitch_cero_es_bit_exacto() {
     // Con rate exacto 1.0 el deck lee índices enteros: la salida debe ser la
     // entrada sin tocar. Es la referencia contra la que se mide todo lo demás.
     let src = sine(1000.0, SOURCE_FRAMES, 0.5, SR as f64);
     let y = render(vec![(0, src.clone())], &Settings::default());
-    let max_diff = (0..RENDER_FRAMES)
+    // Se saltea el arranque: al dar play hay un fade-in de 5 ms (240 frames)
+    // para no cortar en seco. Después de eso el camino es bit-exacto.
+    let max_diff = (1_000..RENDER_FRAMES)
         .map(|i| (y[i * 2] - src[i * 2]).abs())
         .fold(0.0f32, f32::max);
-    assert!(max_diff <= 1e-7, "rate 1.0 debe ser transparente, desvío {max_diff:e}");
+    assert!(max_diff <= 1e-7, "rate 1.0 debe ser transparente tras el fade-in, desvío {max_diff:e}");
 }
 
 #[test]

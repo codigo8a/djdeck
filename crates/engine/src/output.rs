@@ -15,6 +15,7 @@ use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, Stream, StreamConfig, SupportedStreamConfigRange};
 use std::io::Write;
+use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -49,7 +50,10 @@ pub struct AudioOutput {
     pub sample_format: SampleFormat,
 }
 
-pub fn start(controls: Arc<Controls>, pending: PendingLoads, want_frames: u32) -> Result<AudioOutput> {
+pub fn start<H>(controls: H, pending: PendingLoads, want_frames: u32) -> Result<AudioOutput>
+where
+    H: Deref<Target = Controls> + Clone + Send + 'static,
+{
     let want_frames = std::env::var("DJDECK_FRAMES")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())

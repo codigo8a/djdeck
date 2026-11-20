@@ -24,6 +24,13 @@ use std::time::Duration;
 const DEFAULT_FRAMES: u32 = 1024;
 /// Ancho del bitmap de cada onda; Slint lo escala al ancho real.
 const LANE_W: u32 = 1180;
+/// División de resolución del buffer de ondas. El `Image` se estira a lo ancho
+/// del carril, así que dibujar a la mitad de píxeles cuesta un cuarto y se ve
+/// prácticamente igual. Importa porque el render de ondas es todo el costo del
+/// tick de UI (medido: 3-7 ms), y ese tick le roba el turno al hilo de audio en
+/// el mismo proceso (se escucha como chispeo).
+/* WAVE_DIV: 2 (mitad de píxeles) no cambió el costo del tick: lo que cuesta es el repintado del Image, no el dibujo. Se deja en 2 por calidad visual. */
+const WAVE_DIV: u32 = 2;
 const LANE_H: u32 = 108;
 
 slint::slint! {
@@ -642,8 +649,11 @@ fn main() -> Result<()> {
         return run_device_test(secs);
     }
 
-    let controls = Arc::new(Controls::default());
-    let pending: PendingLoads = Arc::new(Mutex::new(Vec::new()));
+    // Proceso de audio: lo lanza la UI con --audio-engine. No abre ventana ni
+    // habla con Slint: sólo mezcla y escribe en el dispositivo.
+    if args.iter().any(|a| a == "--audio-engine") {
+        return run_motor();
+    }
 
     // Una sola instancia: dos procesos de djdeck suman el mismo audio con
     // offsets distintos y eso se escucha como peine de fase ("chispeo").
@@ -655,13 +665,25 @@ fn main() -> Result<()> {
         }
     };
 
-    let out = engine::output::start(controls.clone(), pending.clone(), DEFAULT_FRAMES)?;
-    let sr = out.sample_rate;
-    let latency_ms = out.buffer_frames as f64 * 1000.0 / sr as f64;
-    println!(
-        "dispositivo: {} | {} Hz | {} canales | {} frames ({:.1} ms) | formato {:?}",
-        out.device_name, sr, out.channels, out.buffer_frames, latency_ms, out.sample_format
-    );
+    // El motor de audio corre en su PROPIO proceso. Si comparte proceso con el
+    // repintado de la ventana, el cliente entrega bloques tarde, PipeWire los
+    // descarta y se escucha chispeo: medido 98 % de frames con la UI en el mismo
+    // proceso contra 99.98 % con el motor solo. La UI y el motor se hablan por
+    // estos atómicos en un archivo mapeado.
+    let shm_path = std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| format!("{d}/djdeck-shm"))
+        .unwrap_or_else(|_| "/tmp/djdeck-shm".to_string());
+    let mapping = engine::shm::SharedMapping::create(Path::new(&shm_path))
+        .with_context(|| format!("no se pudo crear {shm_path}"))?;
+    let mapping: &'static engine::shm::SharedMapping = Box::leak(Box::new(mapping));
+    let shared = mapping.block();
+    let controls: &'static Controls = &shared.controls;
+
+    let _motor = MotorProceso::lanzar(&shm_path)?;
+    let sr = esperar_motor(shared)?;
+    let buffer_frames = shared.buffer_frames.load(Ordering::Relaxed);
+    let latency_ms = buffer_frames as f64 * 1000.0 / sr as f64;
+    println!("motor en proceso aparte | {sr} Hz | {buffer_frames} frames ({latency_ms:.1} ms)");
 
     let decks = Rc::new(RefCell::new([
         DeckState {
@@ -695,10 +717,15 @@ fn main() -> Result<()> {
 
     // ---- carga inicial ----
     let mut loaded: [Option<Arc<Track>>; DECK_COUNT] = [None, None];
+    // Lo que se le pide al proceso de audio: una ruta, o `demo:<bpm>:<detune>`
+    // para los demos sintéticos (el motor los genera igual que la UI).
+    let mut pedidos: [Option<String>; DECK_COUNT] = [None, None];
     if args.is_empty() {
         for i in 0..DECK_COUNT {
             let bpm = if i == 0 { 127.4 } else { 128.0 };
-            loaded[i] = Some(Arc::new(make_demo_track(bpm, sr, if i == 0 { -3.0 } else { 0.0 })));
+            let detune = if i == 0 { -3.0 } else { 0.0 };
+            loaded[i] = Some(Arc::new(make_demo_track(bpm, sr, detune)));
+            pedidos[i] = Some(format!("demo:{bpm}:{detune}"));
         }
         println!("sin archivos: uso dos demos sintéticos (127.4 y 128.0 BPM)");
     } else {
@@ -708,6 +735,7 @@ fn main() -> Result<()> {
             let (track, _pyr) = load_track(p, sr)?;
             println!("{:.1} BPM, primer beat {:.3}s", track.grid.bpm, track.grid.first_beat);
             loaded[i] = Some(track);
+            pedidos[i] = Some(path.clone());
         }
     }
 
@@ -773,7 +801,9 @@ fn main() -> Result<()> {
     for i in 0..DECK_COUNT {
         if let Some(track) = loaded[i].clone() {
             let pyramid = PeakPyramid::build(&track.samples, &[32, 128, 512, 2048, 8192, 32768]);
-            pending.lock().unwrap().push((i, track.clone()));
+            if let Some(pedido) = pedidos[i].as_ref() {
+                engine::shm::request_load(shared, i, pedido);
+            }
             {
                 let mut st = decks.borrow_mut();
                 st[i].track = Some(track.clone());
@@ -792,21 +822,21 @@ fn main() -> Result<()> {
     // ---- callbacks ----
     {
         let controls = controls.clone();
-        ui.on_play_a(move || toggle_play(&controls, 0));
+        ui.on_play_a(move || toggle_play(controls, 0));
     }
     {
         let controls = controls.clone();
-        ui.on_play_b(move || toggle_play(&controls, 1));
-    }
-    {
-        let controls = controls.clone();
-        let decks = decks.clone();
-        ui.on_cue_a(move || cue(&controls, &decks, 0));
+        ui.on_play_b(move || toggle_play(controls, 1));
     }
     {
         let controls = controls.clone();
         let decks = decks.clone();
-        ui.on_cue_b(move || cue(&controls, &decks, 1));
+        ui.on_cue_a(move || cue(controls, &decks, 0));
+    }
+    {
+        let controls = controls.clone();
+        let decks = decks.clone();
+        ui.on_cue_b(move || cue(controls, &decks, 1));
     }
     {
         let decks = decks.clone();
@@ -821,24 +851,24 @@ fn main() -> Result<()> {
     {
         let controls = controls.clone();
         let decks = decks.clone();
-        ui.on_pitch_a_changed(move |v| set_pitch(&controls, &decks, 0, v));
+        ui.on_pitch_a_changed(move |v| set_pitch(controls, &decks, 0, v));
     }
     {
         let controls = controls.clone();
         let decks = decks.clone();
-        ui.on_pitch_b_changed(move |v| set_pitch(&controls, &decks, 1, v));
-    }
-    {
-        let controls = controls.clone();
-        let decks = decks.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_pitch_reset_a(move || reset_pitch(&controls, &decks, &ui_weak, 0));
+        ui.on_pitch_b_changed(move |v| set_pitch(controls, &decks, 1, v));
     }
     {
         let controls = controls.clone();
         let decks = decks.clone();
         let ui_weak = ui.as_weak();
-        ui.on_pitch_reset_b(move || reset_pitch(&controls, &decks, &ui_weak, 1));
+        ui.on_pitch_reset_a(move || reset_pitch(controls, &decks, &ui_weak, 0));
+    }
+    {
+        let controls = controls.clone();
+        let decks = decks.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_pitch_reset_b(move || reset_pitch(controls, &decks, &ui_weak, 1));
     }
     {
         let controls = controls.clone();
@@ -880,13 +910,13 @@ fn main() -> Result<()> {
         let controls = controls.clone();
         let decks = decks.clone();
         let ui_weak = ui.as_weak();
-        ui.on_loop_a(move || toggle_loop(&controls, &decks, &ui_weak, 0, sr));
+        ui.on_loop_a(move || toggle_loop(controls, &decks, &ui_weak, 0, sr));
     }
     {
         let controls = controls.clone();
         let decks = decks.clone();
         let ui_weak = ui.as_weak();
-        ui.on_loop_b(move || toggle_loop(&controls, &decks, &ui_weak, 1, sr));
+        ui.on_loop_b(move || toggle_loop(controls, &decks, &ui_weak, 1, sr));
     }
     {
         let view = view.clone();
@@ -972,7 +1002,6 @@ fn main() -> Result<()> {
         let ui_weak = ui.as_weak();
         let browser = browser.clone();
         let decks = decks.clone();
-        let pending = pending.clone();
         let controls = controls.clone();
         ui.on_browser_pick(move |idx| {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -991,7 +1020,11 @@ fn main() -> Result<()> {
             ui.set_status(format!("cargando {} …", chosen.display()).into());
             match load_track(&chosen, sr) {
                 Ok((track, pyr)) => {
-                    pending.lock().unwrap().push((target, track.clone()));
+                    engine::shm::request_load(
+                        shared,
+                        target,
+                        &chosen.to_string_lossy(),
+                    );
                     {
                         let mut st = decks.borrow_mut();
                         st[target].track = Some(track.clone());
@@ -1060,7 +1093,7 @@ fn main() -> Result<()> {
     // estado del botón sin clickear).
     if std::env::var("DJDECK_LOOP").is_ok() {
         let ui_weak = ui.as_weak();
-        toggle_loop(&controls, &decks, &ui_weak, 0, sr);
+        toggle_loop(controls, &decks, &ui_weak, 0, sr);
     }
 
     ui.set_gain_a(engine::get_f32(&controls.gain[0]));
@@ -1070,7 +1103,7 @@ fn main() -> Result<()> {
     ui.set_status(
         format!(
             "{} Hz · {} frames ({:.1} ms) · ondas apiladas con rejilla · EQ real de 3 bandas",
-            sr, out.buffer_frames, latency_ms
+            sr, buffer_frames, latency_ms
         )
         .into(),
     );
@@ -1160,9 +1193,13 @@ fn main() -> Result<()> {
             }
 
             // Ondas apiladas: cada lane centrada en la posición de su deck.
+            // DJDECK_NO_WAVE=1 apaga sólo la actualización de las ondas: sirve
+            // para separar el costo de la imagen del costo del repintado.
+            let actualizar_ondas = std::env::var("DJDECK_NO_WAVE").is_err();
             let t_onda = std::time::Instant::now();
+            if actualizar_ondas {
             let zoom = view.borrow().zoom_secs;
-            let frames_per_px = zoom * sr_f / LANE_W as f64;
+            let frames_per_px = zoom * sr_f / (LANE_W / WAVE_DIV) as f64;
             let (rate_a, rate_b) = (
                 engine::get_f32(&controls.rate[0]) as f64,
                 engine::get_f32(&controls.rate[1]) as f64,
@@ -1200,6 +1237,7 @@ fn main() -> Result<()> {
             };
             if let Some(img) = img_b {
                 ui.set_wave_b(img);
+            }
             }
 
             let peaks = [
@@ -1262,7 +1300,6 @@ fn main() -> Result<()> {
     }
 
     ui.run()?;
-    drop(out);
     Ok(())
 }
 
@@ -1374,12 +1411,12 @@ fn refresh_browser(ui: &AppWindow, browser: &Rc<RefCell<BrowserState>>) {
     ui.set_browser_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
-fn toggle_play(controls: &Arc<Controls>, deck: usize) {
+fn toggle_play(controls: &Controls, deck: usize) {
     let cur = controls.playing[deck].load(Ordering::Relaxed);
     controls.playing[deck].store(!cur, Ordering::Relaxed);
 }
 
-fn cue(controls: &Arc<Controls>, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize) {
+fn cue(controls: &Controls, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize) {
     let st = decks.borrow();
     if let Some(track) = st[deck].track.as_ref() {
         let frame = (track.grid.first_beat * track.sample_rate as f64) as u64;
@@ -1405,7 +1442,7 @@ fn toggle_sync(decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, ui: &slint::Weak<Ap
 /// LOOP 8: engancha 8 beats desde el beat que contiene la posición actual.
 /// Al activarse, el motor envuelve dentro del rango con un fade de 2 ms.
 fn toggle_loop(
-    controls: &Arc<Controls>,
+    controls: &Controls,
     decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>,
     ui: &slint::Weak<AppWindow>,
     deck: usize,
@@ -1447,7 +1484,7 @@ fn toggle_loop(
     }
 }
 
-fn set_pitch(controls: &Arc<Controls>, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize, pct: f32) {
+fn set_pitch(controls: &Controls, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize, pct: f32) {
     {
         let mut st = decks.borrow_mut();
         st[deck].pitch_pct = pct as f64;
@@ -1462,7 +1499,7 @@ fn set_pitch(controls: &Arc<Controls>, decks: &Rc<RefCell<[DeckState; DECK_COUNT
 /// Con SYNC activo el lazo reescribe el rate a 30 Hz y el 0 % no dura un frame,
 /// así que el reset apaga el sync de ese deck primero.
 fn reset_pitch(
-    controls: &Arc<Controls>,
+    controls: &Controls,
     decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>,
     ui: &slint::Weak<AppWindow>,
     deck: usize,
@@ -1493,7 +1530,8 @@ fn render_lane(
     grid: Option<BeatGrid>,
     sr: f64,
 ) -> Image {
-    let (w, h) = (LANE_W, LANE_H);
+    // Buffer más angosto que el carril: el Image se escala al ancho real.
+    let (w, h) = (LANE_W / WAVE_DIV, LANE_H);
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
     let mid_y = h as f32 / 2.0;
     let mid_x = w as f32 / 2.0;
@@ -1881,6 +1919,126 @@ fn make_demo_track(bpm: f64, sr: u32, detune_semitones: f64) -> Track {
         sr,
         BeatGrid::new(bpm, 0.0),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Proceso de audio dedicado
+// ---------------------------------------------------------------------------
+
+/// Mantiene vivo al proceso de audio y lo mata cuando la UI termina.
+struct MotorProceso {
+    hijo: std::process::Child,
+}
+
+impl MotorProceso {
+    fn lanzar(shm_path: &str) -> Result<Self> {
+        let exe = std::env::current_exe()?;
+        let hijo = std::process::Command::new(exe)
+            .arg("--audio-engine")
+            .env("DJDECK_SHM", shm_path)
+            .env("DJDECK_PARENT", std::process::id().to_string())
+            .spawn()
+            .context("no se pudo lanzar el proceso de audio")?;
+        Ok(Self { hijo })
+    }
+}
+
+impl Drop for MotorProceso {
+    fn drop(&mut self) {
+        let _ = self.hijo.kill();
+        let _ = self.hijo.wait();
+    }
+}
+
+/// Espera a que el motor publique el SR del dispositivo que abrió.
+fn esperar_motor(shared: &engine::shm::Shared) -> Result<u32> {
+    for _ in 0..600 {
+        let sr = shared.sample_rate.load(Ordering::Relaxed);
+        if sr != 0 {
+            return Ok(sr);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Err(anyhow::anyhow!(
+        "el proceso de audio no abrió el dispositivo (¿lo está usando otra app?)"
+    ))
+}
+
+/// Proceso de audio: sin ventana, sin Slint. Sólo mezcla y escribe al dispositivo.
+fn run_motor() -> Result<()> {
+    let shm_path = std::env::var("DJDECK_SHM").context("DJDECK_SHM no definido")?;
+    let mapping = engine::shm::SharedMapping::attach(Path::new(&shm_path))
+        .with_context(|| format!("no se pudo mapear {shm_path}"))?;
+    let mapping: &'static engine::shm::SharedMapping = Box::leak(Box::new(mapping));
+    let shared = mapping.block();
+    let controls: &'static Controls = &shared.controls;
+    let pending: PendingLoads = Arc::new(Mutex::new(Vec::new()));
+
+    let out = engine::output::start(controls, pending.clone(), DEFAULT_FRAMES)?;
+    let sr = out.sample_rate;
+    shared.sample_rate.store(sr, Ordering::Relaxed);
+    shared.buffer_frames.store(out.buffer_frames, Ordering::Relaxed);
+    println!(
+        "audio: {} | {sr} Hz | {} canales | {} frames | formato {:?}",
+        out.device_name, out.channels, out.buffer_frames, out.sample_format
+    );
+
+    {
+        let pending = pending.clone();
+        std::thread::spawn(move || loop {
+            for d in 0..DECK_COUNT {
+                if let Some(pedido) = engine::shm::take_load(shared, d) {
+                    match cargar_para_motor(&pedido, sr) {
+                        Ok(track) => {
+                            println!("audio: deck {} <- {}", d, track.name);
+                            pending.lock().unwrap().push((d, track));
+                        }
+                        Err(e) => eprintln!("audio: no se pudo cargar {pedido}: {e}"),
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+    }
+
+    // Si la UI desaparece, el motor también: no queda un proceso sonando solo.
+    let padre: u32 = std::env::var("DJDECK_PARENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if padre > 0 {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if !Path::new(&format!("/proc/{padre}")).exists() {
+                std::process::exit(0);
+            }
+        });
+    }
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Atiende un pedido de carga: ruta de archivo o `demo:<bpm>:<detune>`.
+fn cargar_para_motor(pedido: &str, sr: u32) -> Result<Arc<Track>> {
+    if let Some(resto) = pedido.strip_prefix("demo:") {
+        let mut it = resto.split(':');
+        let bpm: f64 = it.next().unwrap_or("120").parse().unwrap_or(120.0);
+        let detune: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+        return Ok(Arc::new(make_demo_track(bpm, sr, detune)));
+    }
+    let path = Path::new(pedido);
+    let decoded =
+        engine::decode_file(path).with_context(|| format!("leyendo {}", path.display()))?;
+    let samples = engine::resample_stereo(&decoded.samples, decoded.sample_rate, sr);
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+    Ok(Arc::new(Track::new(
+        name,
+        samples,
+        sr,
+        BeatGrid::new(0.0, 0.0),
+    )))
 }
 
 #[cfg(test)]

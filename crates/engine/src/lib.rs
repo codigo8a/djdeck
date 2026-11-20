@@ -12,11 +12,13 @@ pub mod decode;
 pub mod eq;
 pub mod output;
 pub mod resample;
+pub mod shm;
 pub mod sync;
 
 use anyhow::Result;
 use resample::frame_at;
 use std::path::Path;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use sync::BeatGrid;
@@ -34,6 +36,7 @@ pub const DECK_COUNT: usize = 2;
 
 /// Estado que la UI escribe y el callback lee. Sólo escalares atómicos: el hilo
 /// de audio nunca espera un lock por un fader.
+#[repr(C)]
 pub struct Controls {
     pub playing: [AtomicBool; DECK_COUNT],
     pub rate: [AtomicU32; DECK_COUNT],
@@ -191,6 +194,18 @@ struct Deck {
     loop_start: f64,
     loop_end: f64,
     fade_in: i32,
+    /// Envolvente de play/pausa (0..1). Sin ella, pausar o dar CUE corta la
+    /// señal en un solo sample: un escalón del tamaño de la muestra actual que
+    /// suena a click y excita la etapa analógica.
+    fade: f32,
+    fade_step: f32,
+    /// Salto de posición pendiente: se aplica cuando la envolvente llega a cero,
+    /// así el seek no genera un escalón.
+    seek_pending: Option<f64>,
+    /// Posición al empezar el fade de pausa: al terminar se vuelve ahí, así
+    /// pausar no corre el playhead.
+    fade_start: Option<f64>,
+    playing_prev: bool,
 }
 
 impl Deck {
@@ -206,6 +221,13 @@ impl Deck {
             loop_start: 0.0,
             loop_end: 0.0,
             fade_in: 0,
+            // 5 ms de rampa: suficiente para que el escalón no exista y corto
+            // como para no sentirse como un fade.
+            fade: 0.0,
+            fade_step: (1.0 / (0.005 * sample_rate as f32)).max(1.0 / 4096.0),
+            seek_pending: None,
+            fade_start: None,
+            playing_prev: false,
         }
     }
 
@@ -215,7 +237,15 @@ impl Deck {
             .as_ref()
             .map(|t| t.frames().saturating_sub(1) as f64)
             .unwrap_or(0.0);
-        self.pos = frame.clamp(0.0, max);
+        let target = frame.clamp(0.0, max);
+        if self.fade > 0.0 {
+            // Hay audio sonando: el salto se aplica recién con la envolvente en
+            // cero. Un salto de posición también es un escalón.
+            self.seek_pending = Some(target);
+        } else {
+            self.pos = target;
+            self.seek_pending = None;
+        }
     }
 
     /// Siguiente frame del deck, o `None` si está parado o terminó.
@@ -223,10 +253,33 @@ impl Deck {
     /// en el borde: el salto de un loop es inevitable, el click no.
     #[inline]
     fn next_frame(&mut self) -> Option<(f32, f32)> {
-        if !self.playing {
-            return None;
-        }
         let track = self.track.as_ref()?;
+
+        // Envolvente de play/pausa: sube o baja en 5 ms en vez de cortar en seco.
+        // Con un seek pendiente baja a cero, se aplica el salto y vuelve a subir.
+        if !self.playing && self.playing_prev {
+            self.fade_start = Some(self.pos);
+        }
+        self.playing_prev = self.playing;
+        let objetivo = if self.playing && self.seek_pending.is_none() { 1.0 } else { 0.0 };
+        if self.fade < objetivo {
+            self.fade = (self.fade + self.fade_step).min(objetivo);
+        } else if self.fade > objetivo {
+            self.fade = (self.fade - self.fade_step).max(objetivo);
+        }
+        if self.fade <= 0.0 {
+            if let Some(target) = self.seek_pending.take() {
+                self.pos = target;
+                self.fade_start = None;
+            } else if !self.playing {
+                // Terminó el fade: la posición vuelve a donde se pausó.
+                if let Some(pausado) = self.fade_start.take() {
+                    self.pos = pausado;
+                }
+                return None;
+            }
+        }
+
         let last = track.frames().saturating_sub(1) as f64;
         let looping = self.loop_on && self.loop_end > self.loop_start + 2.0;
 
@@ -236,8 +289,8 @@ impl Deck {
             self.fade_in = LOOP_FADE;
         }
         if self.pos >= last {
+            // Fin del track: no se corta, se apaga con la misma envolvente.
             self.playing = false;
-            return None;
         }
 
         let (mut l, mut r) = frame_at(&track.samples, self.pos);
@@ -258,19 +311,23 @@ impl Deck {
         }
 
         self.pos += self.rate;
-        Some(self.eq.process_stereo(l, r))
+        let g = self.fade;
+        Some(self.eq.process_stereo(l * g, r * g))
     }
 }
 
-pub struct Mixer {
+/// Motor de mezcla. `H` es el handle a los controles: `Arc<Controls>` cuando
+/// todo vive en un proceso (tests, autoplay) o una referencia a la memoria
+/// compartida cuando el audio corre en su propio proceso.
+pub struct Mixer<H = Arc<Controls>> {
     decks: [Deck; DECK_COUNT],
-    controls: Arc<Controls>,
+    controls: H,
     pending: PendingLoads,
     sample_rate: u32,
 }
 
-impl Mixer {
-    pub fn new(controls: Arc<Controls>, pending: PendingLoads, sample_rate: u32) -> Self {
+impl<H: Deref<Target = Controls> + Clone> Mixer<H> {
+    pub fn new(controls: H, pending: PendingLoads, sample_rate: u32) -> Self {
         Self {
             decks: [Deck::new(sample_rate), Deck::new(sample_rate)],
             controls,
@@ -294,6 +351,7 @@ impl Mixer {
             let frames = track.frames() as u64;
             self.decks[idx].track = Some(track);
             self.decks[idx].pos = 0.0;
+            self.decks[idx].fade = 0.0;
             self.controls.length[idx].store(frames, Ordering::Relaxed);
             self.controls.position[idx].store(0, Ordering::Relaxed);
             // El estado de play lo decide quien controla: cargar un track no

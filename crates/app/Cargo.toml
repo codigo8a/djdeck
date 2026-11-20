@@ -13,4 +13,7 @@ slint = { version = "1", default-features = false, features = [
     "compat-1-2",
     "backend-winit",
     "renderer-software",
+    # Renderer por GPU (llvmpipe en este equipo). Se elige en runtime con
+    # SLINT_BACKEND=winit-femtovg; el default sigue siendo software.
+    "renderer-femtovg",
 ] }
