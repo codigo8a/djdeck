@@ -319,18 +319,19 @@ fn resample_44_1_a_48_mantiene_los_graves_limpios() {
 
 #[test]
 fn resample_44_1_a_48_rechaza_imagenes_en_agudos() {
-    // Deuda conocida y la causa más audible con archivos reales: Catmull-Rom no
-    // tiene filtro anti-imagen. Un tono de 10 kHz deja una imagen en 44.1-10 =
-    // 34.1 kHz que en un stream de 48 kHz se pliega a 13.9 kHz, a -30 dB; y uno
-    // de 15 kHz plegado a 18.9 kHz a -17 dB. Se fija el nivel actual para que no
-    // empeore: un sinc/polyphase lo baja a -80 dB y estos tests siguen pasando.
+    // Un remuestreo sin filtro anti-imagen deja imágenes espectrales dentro de
+    // la banda audible: Catmull-Rom medía -26.4 dB en 10 kHz (imagen de
+    // 44.1-10 = 34.1 kHz plegada a 13.9 kHz) y -13.8 dB en 15 kHz (plegada a
+    // 18.9 kHz). Sobre música real eso daba -13 dB de error en 12-16 kHz, que se
+    // escucha como chispeo. El sinc con ventana de Kaiser tiene que dejarlo
+    // bajo -80 dB.
     let out10 = engine::resample_stereo(&sine(10_000.0, SOURCE_FRAMES, 0.4, 44_100.0), 44_100, SR);
     let d10 = inband_db(&out10, 10_000.0);
-    assert!(d10 <= -25.0, "imagen de 10 kHz no debe empeorar de -26.4 dB: {}", describe(&out10, 10_000.0));
+    assert!(d10 <= -80.0, "imagen de 10 kHz: {}", describe(&out10, 10_000.0));
 
     let out15 = engine::resample_stereo(&sine(15_000.0, SOURCE_FRAMES, 0.4, 44_100.0), 44_100, SR);
     let d15 = inband_db(&out15, 15_000.0);
-    assert!(d15 <= -12.0, "imagen de 15 kHz no debe empeorar de -13.8 dB: {}", describe(&out15, 15_000.0));
+    assert!(d15 <= -75.0, "imagen de 15 kHz: {}", describe(&out15, 15_000.0));
 }
 
 #[test]

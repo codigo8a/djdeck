@@ -50,7 +50,7 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
 | Salida de audio | `cpal` 0.15 | ALSA nativo en Linux; PipeWire a través de su plugin ALSA. |
 | Decodificación | `symphonia` 0.5 | mp3/aac/flac/wav/aiff/isomp4 en Rust puro, sin ffmpeg del sistema. |
 | UI | `slint` 1.19 (renderer software) | Sin GPU dedicada en el equipo objetivo: llvmpipe arrastra la waveform. |
-| Remuestreo | propio (Catmull-Rom) | Un solo punto de conversión al SR del dispositivo, testeable, sin dependencia extra. |
+| Remuestreo | propio (sinc con ventana de Kaiser, polifásico) | Un solo punto de conversión al SR del dispositivo, testeable, sin dependencia extra. Filtra las imágenes espectrales: una interpolación polinómica las deja caer en la banda audible. |
 | Análisis | propio | Autocorrelación de envolvente: determinística y verificable con click-tracks. |
 | Hilos | atómicos + cola con `try_lock` | El callback de audio no decodifica, no reserva memoria y no espera un lock por un fader. |
 
@@ -96,7 +96,7 @@ una regresión falla. Lo medido hoy, con los puntos flojos declarados como deuda
 | Limiter bajo 0.8 de entrada | transparente (−103 dB) |
 | Limiter a 1.35 de entrada | −18.9 dB con armónico en 3 kHz *(deuda: es un tanh, sin lookahead)* |
 | Remuestreo 44.1→48, 1 kHz | −89 dB |
-| Remuestreo 44.1→48, 10 kHz / 15 kHz | **−26 dB / −14 dB por imágenes aliasadas** *(deuda: Catmull-Rom no tiene filtro anti-imagen)* |
+| Remuestreo 44.1→48, 10 kHz / 15 kHz | **−98 dB / −94 dB** (sinc polifásico, 48 taps, ventana de Kaiser) |
 | Pitch ±2…8 %, 1 kHz | −64 dB |
 | Pitch +8 %, 10 kHz / 15 kHz | **−22 dB / −13.5 dB** *(deuda: `frame_at` interpola lineal; un cúbico lo bajaría ~40 dB)* |
 | EQ mid +12 dB | **−12.9 dB** *(deuda: el EQ va antes del limiter y no compensa headroom)* |
