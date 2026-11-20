@@ -141,8 +141,9 @@ mismo enlace: `gnome-remote-desktop` captura el monitor del sink y lo codifica, 
 de la interfaz compite con el stream de audio. El síntoma es un chispeo que aparece **sólo mientras
 hay sonido**, no depende del volumen, empeora cuanto más se mueve la ventana y **no existe en
 ninguna captura digital del motor** (medido: render idéntico a la referencia de soxr a −108 dB). No
-es la app: se arregla bajando el refresco de la UI (`DJDECK_UI_MS=1000`), bajando la calidad de video
-del cliente remoto, o escuchando en la máquina local.
+es la app. Por eso el refresco de la UI por defecto es **66 ms (15 Hz)**: medido por RDP, a 30 Hz se
+escucha chispeo, a 15 Hz limpio, a 1 Hz limpio. Con auriculares en la máquina local,
+`DJDECK_UI_MS=33` devuelve los 30 Hz completos sin penalidad.
 
 Para diagnosticar el camino de audio hay dos variables más: `DJDECK_DIAG=<segundos>` arranca la UI,
 reproduce los dos decks y reporta cada 5 s qué porcentaje de los frames se renderizaron, los xruns,

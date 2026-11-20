@@ -1134,12 +1134,15 @@ fn main() -> Result<()> {
         let ui_weak = ui.as_weak();
         let sr_f = sr as f64;
         let timer = Timer::default();
-        // El refresco de la UI se puede frenar con DJDECK_UI_MS para medir
-        // cuánto del presupuesto de audio se come el render de las ondas.
+        // Refresco de la UI. Default 66 ms (15 Hz) y no 33 (30 Hz): sobre
+        // escritorio remoto el video de la ventana compite con el audio en el
+        // mismo enlace y 30 Hz se escucha como chispeo (medido con RDP: a 1 Hz
+        // limpio, a 30 Hz con chispeo, a 15 Hz limpio). En la máquina local
+        // DJDECK_UI_MS=33 da el refresco completo sin penalidad.
         let ui_ms = std::env::var("DJDECK_UI_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(33);
+            .unwrap_or(66);
         let wave_state = Rc::new(RefCell::new([WaveRender::default(); DECK_COUNT]));
         let mut tick_n = 0u32;
         let mut tick_max = 0.0f64;
