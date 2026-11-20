@@ -1139,10 +1139,21 @@ fn main() -> Result<()> {
         // mismo enlace y 30 Hz se escucha como chispeo (medido con RDP: a 1 Hz
         // limpio, a 30 Hz con chispeo, a 15 Hz limpio). En la máquina local
         // DJDECK_UI_MS=33 da el refresco completo sin penalidad.
+        //
+        // DJDECK_REMOTO=1 baja a 1 Hz: comprobado que con la ventana en segundo
+        // plano (sin video que codificar) el audio sale limpio, así que dejar la
+        // ventana casi estática es la forma de escuchar por escritorio remoto
+        // con la UI a la vista.
         let ui_ms = std::env::var("DJDECK_UI_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(66);
+            .unwrap_or_else(|| {
+                if std::env::var("DJDECK_REMOTO").is_ok() {
+                    1000
+                } else {
+                    66
+                }
+            });
         let wave_state = Rc::new(RefCell::new([WaveRender::default(); DECK_COUNT]));
         let mut tick_n = 0u32;
         let mut tick_max = 0.0f64;
@@ -1264,16 +1275,16 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    // La tira se dibujó centrada en ws[i].center: para que la
-                    // posición actual caiga en el centro del carril hay que
-                    // correrla -1 carril más la deriva, escalada a píxeles de
-                    // pantalla.
+                    // La tira se dibujó centrada en ws[i].center. Si el deck
+                    // avanzó, ese punto quedó a la derecha del centro de la
+                    // tira: hay que correr la imagen hacia la IZQUIERDA (x más
+                    // negativo) para que caiga en el centro del carril.
                     let deriva = if ws[i].valido {
                         ((ahora - ws[i].center) / src_per_px) as f32 * WAVE_DIV as f32
                     } else {
                         0.0
                     };
-                    let x = -(LANE_W as f32) + deriva;
+                    let x = -(LANE_W as f32) - deriva;
                     if i == 0 {
                         ui.set_wave_a_x(x);
                     } else {

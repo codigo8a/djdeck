@@ -145,6 +145,28 @@ es la app. Por eso el refresco de la UI por defecto es **66 ms (15 Hz)**: medido
 escucha chispeo, a 15 Hz limpio, a 1 Hz limpio. Con auriculares en la máquina local,
 `DJDECK_UI_MS=33` devuelve los 30 Hz completos sin penalidad.
 
+Confirmado con la prueba definitiva: **con la ventana en segundo plano el audio sale limpio** (no hay
+video que codificar). Para escuchar por escritorio remoto con la UI a la vista está
+`DJDECK_REMOTO=1`, que baja el refresco a 1 Hz: la ventana queda casi estática y el audio deja de
+competir con el video.
+
+### Cómo arrancar según dónde escuchás
+
+| Escenario | Comando |
+|---|---|
+| Pantalla física en la máquina (lo ideal) | `./target/release/app` + `DJDECK_UI_MS=33` para los 30 Hz completos |
+| Escritorio remoto con cliente conectado | `DJDECK_REMOTO=1` (1 Hz) o `DJDECK_UI_MS=200` |
+
+Con pantalla física, además conviene darle prioridad realtime al hilo de audio; hoy no la tiene porque
+no hay límite de `rtprio` para el usuario:
+
+```
+sudo setcap cap_sys_nice+ep target/release/app   # se pierde en cada recompilación
+```
+
+Con eso el hilo de audio del motor corre en `SCHED_FIFO` (verificable con `ps -L -o rtprio -p <pid del
+motor>`) y deja de depender de que el resto del sistema le ceda CPU.
+
 Para diagnosticar el camino de audio hay dos variables más: `DJDECK_DIAG=<segundos>` arranca la UI,
 reproduce los dos decks y reporta cada 5 s qué porcentaje de los frames se renderizaron, los xruns,
 las posiciones, los picos y el costo máximo del tick de UI; `DJDECK_UI_MS=<ms>` cambia el período de
