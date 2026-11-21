@@ -42,7 +42,12 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
   bypass exacto cuando las tres están en 0 dB.
 - Gain por canal + crossfader equal-power (−3 dB en el centro) + limitador suave.
 - Sync: iguala tempo (relación de BPM, recortada a ±8 %) y corrige fase contra el otro deck
-  con un offset de rate de hasta ±3 %, con deadband de 0.004 beat para no vibrar.
+  con un offset de rate de hasta ±3 %, con deadband de 0.004 beat para no vibrar. El SYNC de un deck
+  sólo enciende si **los dos** decks tienen tema cargado (el lazo necesita las dos rejillas; con una
+  vacía antes quedaba el botón prendido, el pitch congelado en el último rate y el fader muerto), y
+  apagarlo devuelve el deck a la posición de su fader en vez de dejarlo desafinado. Sólo puede haber
+  un deck sincronizado: encender uno apaga el otro, porque dos lazos cruzados se pelean y dejan los
+  dos decks clavados en ±3 % (medido: 0.9689 y 1.0311 sin converger).
 - Análisis al cargar: BPM y fase de la rejilla por autocorrelación de la envolvente de onsets.
 - Salida de audio por `cpal` a 48 kHz, bloques de 256 frames (5.3 ms).
 

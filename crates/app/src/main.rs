@@ -948,7 +948,9 @@ struct DeckState {
     looping: bool,
     /// Largo del loop activo en beats; 0 cuando no hay loop.
     loop_beats: f64,
-    pitch_pct: f64,
+    /// Posición del fader de pitch que puso el usuario (%), independiente del
+    /// sync: es a donde vuelve el deck cuando el lazo deja de mandar.
+    fader_pct: f64,
 }
 
 struct ViewState {
@@ -1007,9 +1009,12 @@ fn main() -> Result<()> {
     // descarta y se escucha chispeo: medido 98 % de frames con la UI en el mismo
     // proceso contra 99.98 % con el motor solo. La UI y el motor se hablan por
     // estos atómicos en un archivo mapeado.
-    let shm_path = std::env::var("XDG_RUNTIME_DIR")
-        .map(|d| format!("{d}/djdeck-shm"))
-        .unwrap_or_else(|_| "/tmp/djdeck-shm".to_string());
+    let shm_path = std::env::var("DJDECK_SHM").ok().or_else(|| {
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(|d| format!("{d}/djdeck-shm"))
+            .ok()
+    })
+    .unwrap_or_else(|| "/tmp/djdeck-shm".to_string());
     let mapping = engine::shm::SharedMapping::create(Path::new(&shm_path))
         .with_context(|| format!("no se pudo crear {shm_path}"))?;
     let mapping: &'static engine::shm::SharedMapping = Box::leak(Box::new(mapping));
@@ -1029,7 +1034,7 @@ fn main() -> Result<()> {
             syncing: false,
             looping: false,
             loop_beats: 0.0,
-            pitch_pct: 0.0,
+            fader_pct: 0.0,
         },
         DeckState {
             track: None,
@@ -1037,7 +1042,7 @@ fn main() -> Result<()> {
             syncing: false,
             looping: false,
             loop_beats: 0.0,
-            pitch_pct: 0.0,
+            fader_pct: 0.0,
         },
     ]));
     let view = Rc::new(RefCell::new(ViewState { zoom_secs: 8.0 }));
@@ -1210,12 +1215,12 @@ fn main() -> Result<()> {
     {
         let decks = decks.clone();
         let ui_weak = ui.as_weak();
-        ui.on_sync_a(move || toggle_sync(&decks, &ui_weak, 0));
+        ui.on_sync_a(move || toggle_sync(controls, &decks, &ui_weak, 0));
     }
     {
         let decks = decks.clone();
         let ui_weak = ui.as_weak();
-        ui.on_sync_b(move || toggle_sync(&decks, &ui_weak, 1));
+        ui.on_sync_b(move || toggle_sync(controls, &decks, &ui_weak, 1));
     }
     {
         let controls = controls.clone();
@@ -1404,7 +1409,7 @@ fn main() -> Result<()> {
                         st[target].pyramid = Some(pyr);
                         st[target].syncing = false;
                         st[target].looping = false;
-                        st[target].pitch_pct = 0.0;
+                        st[target].fader_pct = 0.0;
                     }
                     engine::set_f32(&controls.rate[target], 1.0);
                     controls.loop_on[target].store(false, Ordering::Relaxed);
@@ -1528,18 +1533,30 @@ fn main() -> Result<()> {
             // Lazo de sync: el deck sincronizado sigue al otro.
             for i in 0..DECK_COUNT {
                 let other = 1 - i;
-                let (want, my_grid, other_grid) = {
+                let (want, my_grid, other_grid, fader_pct) = {
                     let st = decks.borrow();
                     (
-                        st[i].syncing && st[other].track.is_some(),
+                        st[i].syncing,
                         st[i].track.as_ref().map(|t| t.grid),
                         st[other].track.as_ref().map(|t| t.grid),
+                        st[i].fader_pct,
                     )
                 };
                 if let (true, Some(my_grid), Some(other_grid)) = (want, my_grid, other_grid) {
-                    let (rate, _err) =
+                    let (rate, _) =
                         sync::sync_relative_rate(pos[other], other_grid, pos[i], my_grid, 0.08);
                     engine::set_f32(&controls.rate[i], rate as f32);
+                } else if want {
+                    // Sync sin las dos rejillas: el lazo no puede correr. Se apaga
+                    // y el deck vuelve a su fader; si no, queda congelado en el
+                    // último rate (el fader muerto, el SYNC mintiendo).
+                    decks.borrow_mut()[i].syncing = false;
+                    engine::set_f32(&controls.rate[i], (1.0 + fader_pct / 100.0) as f32);
+                    if i == 0 {
+                        ui.set_synced_a(false);
+                    } else {
+                        ui.set_synced_b(false);
+                    }
                 }
             }
 
@@ -1548,8 +1565,7 @@ fn main() -> Result<()> {
                 let rate = engine::get_f32(&controls.rate[i]) as f64;
                 let pct = (rate - 1.0) * 100.0;
                 let (syncing, grid_bpm) = {
-                    let mut st = decks.borrow_mut();
-                    st[i].pitch_pct = pct;
+                    let st = decks.borrow();
                     (
                         st[i].syncing,
                         st[i].track.as_ref().map(|t| t.grid.bpm).unwrap_or(0.0),
@@ -1878,9 +1894,54 @@ fn cue(controls: &Controls, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: 
     }
 }
 
-fn toggle_sync(decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, ui: &slint::Weak<AppWindow>, deck: usize) {
+fn toggle_sync(
+    controls: &Controls,
+    decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>,
+    ui: &slint::Weak<AppWindow>,
+    deck: usize,
+) {
+    let other = 1 - deck;
+    let (yo, el_otro) = if deck == 0 { ("A", "B") } else { ("B", "A") };
     let mut st = decks.borrow_mut();
-    st[deck].syncing = !st[deck].syncing;
+    let mut aviso: Option<String> = None;
+    let mut otro_apagado = false;
+    if st[deck].syncing {
+        // Apagar: el rate vuelve al fader. Si se queda el del lazo, el deck
+        // queda desafinado (±3 % típico) para siempre y sin SYNC a la vista.
+        st[deck].syncing = false;
+        engine::set_f32(
+            &controls.rate[deck],
+            (1.0 + st[deck].fader_pct / 100.0) as f32,
+        );
+    } else {
+        // Encender exige tema en LOS DOS decks: el lazo necesita las dos
+        // rejillas. Con una vacía no puede correr y el SYNC mentiría (botón
+        // prendido, pitch congelado y fader muerto).
+        let falta = if st[deck].track.is_none() {
+            Some(yo)
+        } else if st[other].track.is_none() {
+            Some(el_otro)
+        } else {
+            None
+        };
+        if let Some(falta) = falta {
+            aviso = Some(format!(
+                "SYNC del deck {yo} necesita un tema en los dos decks: falta en {falta}"
+            ));
+        } else {
+            st[deck].syncing = true;
+            // Un solo master: dos lazos cruzados se pelean y dejan los dos
+            // decks clavados en ±3 %.
+            if st[other].syncing {
+                st[other].syncing = false;
+                otro_apagado = true;
+                engine::set_f32(
+                    &controls.rate[other],
+                    (1.0 + st[other].fader_pct / 100.0) as f32,
+                );
+            }
+        }
+    }
     let on = st[deck].syncing;
     drop(st);
     if let Some(ui) = ui.upgrade() {
@@ -1888,6 +1949,16 @@ fn toggle_sync(decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, ui: &slint::Weak<Ap
             ui.set_synced_a(on);
         } else {
             ui.set_synced_b(on);
+        }
+        if otro_apagado {
+            if other == 0 {
+                ui.set_synced_a(false);
+            } else {
+                ui.set_synced_b(false);
+            }
+        }
+        if let Some(aviso) = aviso {
+            ui.set_status(aviso.into());
         }
     }
 }
@@ -2023,7 +2094,7 @@ fn toggle_loop(
 fn set_pitch(controls: &Controls, decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, deck: usize, pct: f32) {
     {
         let mut st = decks.borrow_mut();
-        st[deck].pitch_pct = pct as f64;
+        st[deck].fader_pct = pct as f64;
         if st[deck].syncing {
             return; // mientras está sincronizado manda el lazo de sync
         }
@@ -2041,7 +2112,7 @@ fn reset_pitch(
     deck: usize,
 ) {
     if decks.borrow()[deck].syncing {
-        toggle_sync(decks, ui, deck);
+        toggle_sync(controls, decks, ui, deck);
     }
     set_pitch(controls, decks, deck, 0.0);
 }
