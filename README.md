@@ -14,13 +14,25 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
 - Dos decks independientes: play/pausa, cue al primer beat, tiempo transcurrido y total.
 - Ondas **apiladas** (A arriba, B abajo) sobre el mismo eje de tiempo, con zoom de 1 a 64 s,
   rejilla de beats (cada 4 más marcada) y playhead fijo al centro: si el sync está bien, los
-  kicks de los dos temas caen en la misma vertical.
+  kicks de los dos temas caen en la misma vertical. La ventana es redimensionable: el eje de
+  tiempo se mapea con el ancho **real** del carril (medido por el layout), no con una constante,
+  así que al maximizar el playhead sigue en el centro y la onda se redibuja a la resolución del
+  carril nuevo en vez de estirar un bitmap chico. Cada carril mide **90 px de alto** y no estira
+  con la ventana: el alto extra va a los paneles de deck y al mixer, que centran su contenido. El
+  playhead es un rectángulo fijo de la UI, no parte del bitmap: la tira se corre con el scroll y la
+  referencia vertical queda clavada en el centro del carril. Los controles de zoom (`− 8 s +`) viven
+  entre los dos carriles, no arriba: así las ondas quedan pegadas al borde superior y no se come alto.
+  La ventana es fluida: no declara `width`/`height` en Slint (eso clavaba el contenido y al maximizar
+  dejaba una banda muerta); el tamaño inicial lo fija Rust con `window().set_size()`.
 - Pitch fader ±8 % (modo vinilo: cambia tempo *y* tono — ver deudas). **Doble click en el fader
   vuelve a 0 % en el centro**; si ese deck estaba en SYNC, el doble click apaga su SYNC, porque el
   lazo de sync reescribe el rate a 30 Hz y el 0 % no duraría un frame. Con SYNC activo el fader y el
   texto se mueven con el lazo: muestra el % real que aplicó el sync y el BPM destino (`126.2 → 131.9`).
-- `LOOP 8`: engancha 8 beats desde el beat que contiene la posición actual y envuelve con un fade de
-  2 ms en el borde (medido: el salto máximo entre muestras en el loop queda bajo 0.05, sin click).
+- `LOOP 4` / `LOOP 8`: enganchan 4 u 8 beats desde el beat que contiene la posición actual y envuelven
+  con un fade de 2 ms en el borde (medido: el salto máximo entre muestras en el loop queda bajo 0.05,
+  sin click). Con un loop activo, pulsar el mismo largo lo apaga; pulsar el otro largo lo reemplaza.
+  El tramo que abarca el loop se marca en la onda con una sombra tenue del color del deck, para ver
+  exactamente qué compases se repiten.
 - EQ de 3 bandas **real** por deck (low shelf 200 Hz, campana 1 kHz, high shelf 4 kHz, ±12 dB), con
   bypass exacto cuando las tres están en 0 dB.
 - Gain por canal + crossfader equal-power (−3 dB en el centro) + limitador suave.
@@ -37,7 +49,7 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
 | Cue / prelisten | los dos decks suenan por la misma salida: **no sirve para tocar en vivo todavía**. |
 | Filtro (LPF/HPF) | el EQ es de 3 bandas; el filtro por canal todavía no está. |
 | Platos / jog wheels | decisión explícita: no se usan; el transporte es por botones y el pitch por fader. |
-| Hotcues y loops manuales | hay loop de 8 beats al vuelo; faltan loop in/out a mano, 1/2/4/16 beats y hotcues. |
+| Hotcues y loops manuales | hay loop de 4 u 8 beats al vuelo; faltan loop in/out a mano, 1/2/16 beats y hotcues. |
 | Biblioteca / base de datos | los tracks se pasan por línea de comandos. |
 | Detección de compás (downbeat) | el sync alinea a nivel de beat, no de compás: dos temas pueden quedar alineados a contratiempo. |
 | Stems | no hay separación de voces/instrumental. En esta máquina demucs.cpp mide 0.094× tiempo real: es trabajo de importación, no de reproducción. |
@@ -125,8 +137,7 @@ medido a 0.5 dB de diferencia entre 2 kHz y 9 kHz; con el pasa-banda mide 16 dB.
 | Buffer 256 frames (5.3 ms) | **84 % del tiempo real**: pipewire-alsa entra en underrun sostenido y el reloj de audio se atrasa. Por eso el default es 1024 |
 | Quantum 256 vs 1024 en el grafo de PipeWire | Con 256 el cliente tiene **5.33 ms** de margen por ciclo y un repintado de la UI (4–7 ms) lo hace llegar tarde: **98 % de los frames** renderizados, un chasquido cada ~300 ms. La app ahora pide `PIPEWIRE_LATENCY = buffer/SR` al abrir el dispositivo (1024/48000) y el nodo negocia 21.3 ms en vez de 5.33 |
 | Detección de BPM, material real | "Can't Get You Out Of My Head" → **126.2** (real 126); remix de Tiësto → 131.9 |
-| UI con las dos ondas a 30 Hz (binario debug) | 35 % de un núcleo, 217 MB RSS, 0 underruns en 100 s |
-| Sync de 126.2 contra 131.9 BPM | offset aplicado **+4.5 %**, rejillas alineadas en pantalla, `126.2 → 131.9` |
+| UI con las dos ondas a 30 Hz (binario debug) | 35 % de un núcleo, 217 MB RSS, 0 underruns en 100 s || Sync de 126.2 contra 131.9 BPM | offset aplicado **+4.5 %**, rejillas alineadas en pantalla, `126.2 → 131.9` |
 
 `DJDECK_FRAMES` y `DJDECK_RATE` permiten forzar buffer y frecuencia; `DJDECK_DEVICE` fuerza un
 dispositivo por subcadena del nombre; `DJDECK_FORMAT=s16|s32|f32` fuerza el formato de muestra
@@ -186,3 +197,10 @@ refresco (default 33 ms) para medir cuánto come el render de las ondas. El `%` 
 ## Licencia
 
 MIT.
+
+Los iconos del transporte (play, pause, cue, sync, cargar, repeat) son paths de
+**Material Symbols** de Google LLC, bajo Apache-2.0. Atribución, origen y cambios
+en `crates/app/icons/NOTICE.md`; copia de la licencia en
+`crates/app/icons/LICENSE-APACHE-2.0.txt`. Se embeben como `Path` de Slint en vez
+de glifos de fuente porque caracteres como `⏸` (U+23F8) no están en DejaVu Sans
+en el equipo objetivo y un glifo faltante se ve como un cuadrado vacío.

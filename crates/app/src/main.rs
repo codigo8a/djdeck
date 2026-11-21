@@ -34,6 +34,8 @@ const WAVE_DIV: u32 = 2;
 /// Cuántos carriles de ancho mide la tira de onda que se dibuja de una vez.
 const STRIP: u32 = 3;
 const LANE_H: u32 = 108;
+/// Piso del alto del bitmap: por debajo de esto la onda no tiene detalle útil.
+const LANE_MIN_PY: i64 = 40;
 
 slint::slint! {
     import { Button, ScrollView, Slider } from "std-widgets.slint";
@@ -123,6 +125,39 @@ slint::slint! {
         }
     }
 
+    // Micro botón del zoom que vive entre las dos ondas. Va hecho a mano con
+    // Rectangle + Text + TouchArea y no con `Button` de std-widgets: ese se
+    // estira en vertical dentro de un layout y el pedido es un control chico
+    // (18x16 px) que no crezca al maximizar.
+    component ZoomButton inherits Rectangle {
+        in property <string> text: "+";
+        callback clicked();
+
+        width: 18px;
+        height: 16px;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: #2b3644;
+        background: touch.has-hover ? #26313d : #1a222c;
+
+        Text {
+            text: root.text;
+            color: touch.pressed ? #eef4fa : #b6c2cf;
+            font-size: 12px;
+            font-weight: 700;
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        touch := TouchArea {
+            clicked => { root.clicked(); }
+        }
+    }
+
     component Lane inherits Rectangle {
         in property <string> label: "A";
         in property <string> track-name: "sin cargar";
@@ -132,8 +167,20 @@ slint::slint! {
         // Desplazamiento de la tira de onda: la imagen se dibuja 3 carriles de
         // ancho y se corre, en vez de redibujarla 30 veces por segundo.
         in property <length> img-x: 0px;
+        // Sombra del loop activo, en píxeles del carril. Se calcula en el
+        // controlador a partir de la posición actual: el playhead está en el
+        // centro, así que la sombra se corre junto con la onda.
+        in property <bool> loop-visible: false;
+        in property <length> loop-x: 0px;
+        in property <length> loop-w: 0px;
         in property <color> accent: #22d3ee;
         in property <bool> synced: false;
+        // Tamaño real del carril en pantalla, medido por el layout. El
+        // controlador lo necesita para mapear frames a píxeles: al maximizar la
+        // ventana el carril cambia de ancho y las constantes de diseño ya no
+        // sirven.
+        out property <length> real-w: body.width;
+        out property <length> real-h: body.height;
 
         VerticalLayout {
             spacing: 3px;
@@ -147,13 +194,47 @@ slint::slint! {
                 Text { text: root.bpm-text; color: #8b98a8; font-size: 11px; vertical-alignment: center; }
                 Text { text: root.time-text; color: #66727f; font-size: 11px; vertical-alignment: center; }
             }
-            Rectangle {
-                vertical-stretch: 1;
-                min-height: 84px;
+            body := Rectangle {
+                height: 90px;
                 background: #070a0e;
                 border-radius: 6px;
                 clip: true;
                 Image { source: root.img; x: root.img-x; width: 300%; height: 100%; }
+
+                // Sombra del loop: un velo tenue del color del deck con dos
+                // filos de 1 px, para ver exactamente qué tramo abarca sin
+                // tapar la onda.
+                Rectangle {
+                    visible: root.loop-visible && root.loop-w > 1px;
+                    x: root.loop-x;
+                    width: root.loop-w;
+                    height: 100%;
+                    background: root.accent.with-alpha(0.08);
+
+                    Rectangle {
+                        x: 0px;
+                        width: 1px;
+                        height: 100%;
+                        background: root.accent.with-alpha(0.35);
+                    }
+                    Rectangle {
+                        x: root.loop-w - 1px;
+                        width: 1px;
+                        height: 100%;
+                        background: root.accent.with-alpha(0.35);
+                    }
+                }
+
+                // Playhead: referencia vertical fija al centro del carril. Va
+                // dibujado acá y no dentro del bitmap porque la tira se corre
+                // con el scroll: adentro de la imagen la línea se iba con la
+                // onda y saltaba al centro en cada redibujado.
+                Rectangle {
+                    x: (parent.width - 2px) / 2;
+                    width: 2px;
+                    height: 100%;
+                    background: #f0f5fa;
+                }
             }
         }
     }
@@ -236,6 +317,130 @@ slint::slint! {
         }
     }
 
+    // Iconos: paths de Material Symbols (Apache-2.0, Google LLC), variante
+    // rounded rellena. Origen y licencia en crates/app/icons/NOTICE.md.
+    // Van como `Path` con viewbox 24x24 y no como glifos de texto porque el
+    // glifo ⏸ (U+23F8) no está en DejaVu Sans en este equipo —sólo en
+    // Symbola/FreeSerif—, y un glifo faltante se ve como un cuadrado vacío.
+    // Todos los elegidos son formas rellenas sin hueco: el renderer software no
+    // respeta el agujero de un path con subpaths de winding opuesto (probado con
+    // trazo, con arcos y con polígono; en los tres casos rellena el centro).
+    enum DeckIcon { play, pause, cue, sync, folder, repeat }
+
+    component DeckGlyph inherits Rectangle {
+        in property <DeckIcon> kind: DeckIcon.play;
+        in property <color> ink: #b6c2cf;
+        background: transparent;
+
+        if kind == DeckIcon.play : Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M8 6.82v10.36c0 .79.87 1.27 1.54.84l8.14-5.18c.62-.39.62-1.29 0-1.69L9.54 5.98C8.87 5.55 8 6.03 8 6.82z";
+            fill: root.ink;
+        }
+
+        if kind == DeckIcon.pause : Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M8 19c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2s-2 .9-2 2v10c0 1.1.9 2 2 2zm6-12v10c0 1.1.9 2 2 2s2-.9 2-2V7c0-1.1-.9-2-2-2s-2 .9-2 2z";
+            fill: root.ink;
+        }
+
+        // CUE: barra + triángulo hacia el punto marcado (skip_previous)
+        if kind == DeckIcon.cue : Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M7 6c.55 0 1 .45 1 1v10c0 .55-.45 1-1 1s-1-.45-1-1V7c0-.55.45-1 1-1zm3.66 6.82l5.77 4.07c.66.47 1.58-.01 1.58-.82V7.93c0-.81-.91-1.28-1.58-.82l-5.77 4.07c-.57.4-.57 1.24 0 1.64z";
+            fill: root.ink;
+        }
+
+        // SYNC: dos flechas en círculo
+        if kind == DeckIcon.sync : Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M12 4V2.21c0-.45-.54-.67-.85-.35l-2.8 2.79c-.2.2-.2.51 0 .71l2.79 2.79c.32.31.86.09.86-.36V6c3.31 0 6 2.69 6 6 0 .79-.15 1.56-.44 2.25-.15.36-.04.77.23 1.04.51.51 1.37.33 1.64-.34.37-.91.57-1.91.57-2.95 0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-.79.15-1.56.44-2.25.15-.36.04-.77-.23-1.04-.51-.51-1.37-.33-1.64.34C4.2 9.96 4 10.96 4 12c0 4.42 3.58 8 8 8v1.79c0 .45.54.67.85.35l2.79-2.79c.2-.2.2-.51 0-.71l-2.79-2.79c-.31-.31-.85-.09-.85.36V18z";
+            fill: root.ink;
+        }
+
+        // CARGAR: carpeta rellena (la variante folder_open tiene hueco y el
+        // renderer software la dibuja maciza, así que se usa `folder`)
+        if kind == DeckIcon.folder : Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M10.59 4.59C10.21 4.21 9.7 4 9.17 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-1.41-1.41z";
+            fill: root.ink;
+        }
+
+        // LOOP: flechas de repetición; el largo en beats va al lado como número
+        if kind == DeckIcon.repeat : Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M7 7h10v1.79c0 .45.54.67.85.35l2.79-2.79c.2-.2.2-.51 0-.71l-2.79-2.79c-.31-.31-.85-.09-.85.36V5H6c-.55 0-1 .45-1 1v4c0 .55.45 1 1 1s1-.45 1-1V7zm10 10H7v-1.79c0-.45-.54-.67-.85-.35l-2.79 2.79c-.2.2-.2.51 0 .71l2.79 2.79c.31.31.85.09.85-.36V19h11c.55 0 1-.45 1-1v-4c0-.55-.45-1-1-1s-1 .45-1 1v3z";
+            fill: root.ink;
+        }
+    }
+
+    // Botón del transporte: icono (y número opcional para el loop) en vez de
+    // texto. Las posiciones son explícitas: dentro de un HorizontalLayout el
+    // glifo de altura fija queda pegado arriba, 5 px fuera del centro.
+    component DeckButton inherits Rectangle {
+        in property <DeckIcon> kind: DeckIcon.play;
+        in property <string> number: "";
+        in property <bool> show-icon: true;
+        in property <bool> active: false;
+        in property <color> accent: #22d3ee;
+        callback clicked();
+
+        width: 34px;
+        height: 26px;
+        border-radius: 5px;
+        border-width: 1px;
+        border-color: root.active ? root.accent.with-alpha(0.8) : #2b3644;
+        background: root.active ? root.accent.with-alpha(0.22) : (touch.has-hover ? #26313d : #1a222c);
+
+        property <color> ink: root.active ? root.accent : (touch.pressed ? #eef4fa : #b6c2cf);
+        property <length> glyph: 18px;
+
+        DeckGlyph {
+            visible: root.show-icon;
+            kind: root.kind;
+            ink: root.ink;
+            width: root.glyph;
+            height: root.glyph;
+            x: root.number == "" ? (root.width - root.glyph) / 2 : 3px;
+            y: (root.height - root.glyph) / 2;
+        }
+
+        Text {
+            visible: root.number != "";
+            text: root.number;
+            color: root.ink;
+            font-size: 13px;
+            font-weight: 700;
+            x: 0px;
+            width: root.show-icon ? root.width - 7px : root.width;
+            height: root.height;
+            horizontal-alignment: root.show-icon ? right : center;
+            vertical-alignment: center;
+        }
+
+        touch := TouchArea {
+            clicked => { root.clicked(); }
+        }
+    }
+
     component DeckPanel inherits Rectangle {
         in property <string> label: "A";
         in property <string> track-name: "sin cargar";
@@ -248,6 +453,8 @@ slint::slint! {
         in property <bool> playing: false;
         in property <bool> synced: false;
         in property <bool> looping: false;
+        // Largo del loop activo en beats: 0 sin loop, 4 u 8 con el botón encendido.
+        in property <int> loop-beats: 0;
         in property <float> meter: 0.0;
         in-out property <float> pitch-pct: 0.0;
         in-out property <float> gain: 0.8;
@@ -261,6 +468,7 @@ slint::slint! {
         callback sync();
         callback browse();
         callback loop8();
+        callback loop4();
         callback pitch-changed(float);
         callback pitch-reset();
         callback gain-changed(float);
@@ -276,6 +484,7 @@ slint::slint! {
         VerticalLayout {
             padding: 12px;
             spacing: 8px;
+            alignment: center;
 
             HorizontalLayout {
                 spacing: 8px;
@@ -287,11 +496,30 @@ slint::slint! {
 
             HorizontalLayout {
                 spacing: 6px;
-                Button { text: root.playing ? "PAUSA" : "PLAY"; clicked => { root.play(); } }
-                Button { text: "CUE"; clicked => { root.cue(); } }
-                Button { text: root.synced ? "SYNC ON" : "SYNC"; clicked => { root.sync(); } }
-                Button { text: "CARGAR"; clicked => { root.browse(); } }
-                Button { text: root.looping ? "LOOP 8 ON" : "LOOP 8"; clicked => { root.loop8(); } }
+                DeckButton {
+                    kind: root.playing ? DeckIcon.pause : DeckIcon.play;
+                    accent: root.accent;
+                    clicked => { root.play(); }
+                }
+                DeckButton { kind: DeckIcon.cue; accent: root.accent; clicked => { root.cue(); } }
+                DeckButton { kind: DeckIcon.sync; active: root.synced; accent: root.accent; clicked => { root.sync(); } }
+                DeckButton { kind: DeckIcon.folder; accent: root.accent; clicked => { root.browse(); } }
+                DeckButton {
+                    kind: DeckIcon.repeat;
+                    number: "8";
+                    active: root.looping && root.loop-beats == 8;
+                    accent: root.accent;
+                    width: 42px;
+                    clicked => { root.loop8(); }
+                }
+                DeckButton {
+                    kind: DeckIcon.repeat;
+                    number: "4";
+                    active: root.looping && root.loop-beats == 4;
+                    accent: root.accent;
+                    width: 42px;
+                    clicked => { root.loop4(); }
+                }
                 Rectangle { horizontal-stretch: 1; }
                 VuMeter { level: root.meter; accent: root.accent; width: 10px; height: 26px; }
             }
@@ -308,7 +536,7 @@ slint::slint! {
                     changed(v) => { root.pitch-changed(v); }
                     reset => { root.pitch-reset(); }
                 }
-                Text { text: root.pitch-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
+                Text { text: root.pitch-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             HorizontalLayout {
@@ -318,7 +546,7 @@ slint::slint! {
                     minimum: 0.0; maximum: 1.5; value: root.gain;
                     changed(v) => { root.gain = v; root.gain-changed(v); }
                 }
-                Text { text: root.gain-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
+                Text { text: root.gain-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             HorizontalLayout {
@@ -328,7 +556,7 @@ slint::slint! {
                     minimum: -12.0; maximum: 12.0; value: root.eq-low;
                     changed(v) => { root.eq-low = v; root.eq-low-changed(v); }
                 }
-                Text { text: root.low-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
+                Text { text: root.low-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             HorizontalLayout {
@@ -338,7 +566,7 @@ slint::slint! {
                     minimum: -12.0; maximum: 12.0; value: root.eq-mid;
                     changed(v) => { root.eq-mid = v; root.eq-mid-changed(v); }
                 }
-                Text { text: root.mid-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
+                Text { text: root.mid-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             HorizontalLayout {
@@ -348,7 +576,7 @@ slint::slint! {
                     minimum: -12.0; maximum: 12.0; value: root.eq-high;
                     changed(v) => { root.eq-high = v; root.eq-high-changed(v); }
                 }
-                Text { text: root.high-text; color: #dbe4ee; font-size: 11px; width: 74px; horizontal-alignment: right; vertical-alignment: center; }
+                Text { text: root.high-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
         }
     }
@@ -368,13 +596,16 @@ slint::slint! {
         VerticalLayout {
             padding: 12px;
             spacing: 10px;
+            alignment: center;
 
             Text { text: "MIXER"; color: #66727f; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
 
             HorizontalLayout {
                 spacing: 14px;
                 alignment: center;
-                vertical-stretch: 1;
+                // Alto explícito: con el layout padre centrado, un hijo con
+                // vertical-stretch se colapsa a 0 y los vumetros desaparecen.
+                height: 160px;
                 VuMeter { level: root.meter-a; accent: #22d3ee; }
                 VuMeter { level: root.meter-b; accent: #fbbf24; }
                 VuMeter { level: root.master; accent: #9aa7b6; }
@@ -398,8 +629,11 @@ slint::slint! {
 
     export component AppWindow inherits Window {
         title: "djdeck";
-        width: 1240px;
-        height: 780px;
+        // Sin width/height acá: si se declaran, el contenido queda clavado en ese
+        // tamaño y al maximizar la ventana el layout no se re-acomoda (quedaba
+        // una banda muerta a la derecha). El tamaño inicial se fija desde Rust
+        // con `set_size`, que es el mismo camino que usa el usuario al
+        // redimensionar.
         background: #0a0e13;
 
         in-out property <string> name-a: "sin cargar";
@@ -424,6 +658,8 @@ slint::slint! {
         in-out property <bool> synced-b: false;
         in-out property <bool> looping-a: false;
         in-out property <bool> looping-b: false;
+        in-out property <int> loop-beats-a: 0;
+        in-out property <int> loop-beats-b: 0;
         in-out property <float> meter-a: 0.0;
         in-out property <float> meter-b: 0.0;
         in-out property <float> meter-master: 0.0;
@@ -440,8 +676,20 @@ slint::slint! {
         in-out property <float> xf: 0.5;
         in-out property <image> wave-a;
         in-out property <length> wave-a-x: 0px;
+        in-out property <bool> loop-a-visible: false;
+        in-out property <length> loop-a-x: 0px;
+        in-out property <length> loop-a-w: 0px;
         in-out property <image> wave-b;
         in-out property <length> wave-b-x: 0px;
+        in-out property <bool> loop-b-visible: false;
+        in-out property <length> loop-b-x: 0px;
+        in-out property <length> loop-b-w: 0px;
+        // Tamaño real de cada carril, medido por el layout. Es la única fuente
+        // de verdad para mapear frames a píxeles cuando la ventana cambia.
+        out property <length> lane-a-w: lane-a.real-w;
+        out property <length> lane-a-h: lane-a.real-h;
+        out property <length> lane-b-w: lane-b.real-w;
+        out property <length> lane-b-h: lane-b.real-h;
         in-out property <string> zoom-text: "8 s";
         in-out property <string> status: "";
         in-out property <bool> browser-open: false;
@@ -471,8 +719,8 @@ slint::slint! {
         callback zoom-out();
         callback browse-a();
         callback browse-b();
-        callback loop-a();
-        callback loop-b();
+        callback loop-a(int);
+        callback loop-b(int);
         callback browser-pick(int);
         callback browser-up();
         callback browser-close();
@@ -482,7 +730,6 @@ slint::slint! {
             spacing: 10px;
 
             Rectangle {
-                vertical-stretch: 1;
                 background: #0c1116;
                 border-radius: 10px;
                 border-width: 1px;
@@ -492,43 +739,79 @@ slint::slint! {
                     padding: 10px;
                     spacing: 6px;
 
-                    HorizontalLayout {
-                        spacing: 6px;
-                        Rectangle { horizontal-stretch: 1; }
-                        Text { text: "ZOOM"; color: #4b5663; font-size: 9px; vertical-alignment: center; }
-                        Button { text: "−"; clicked => { root.zoom-out(); } }
-                        Text { text: root.zoom-text; color: #9aa7b6; font-size: 11px; width: 44px; horizontal-alignment: center; vertical-alignment: center; }
-                        Button { text: "+"; clicked => { root.zoom-in(); } }
-                    }
-
-                    Lane {
+                    // Los carriles no se estiran: el panel mide su contenido
+                    // (2 x 109 px + fila de zoom + padding) y así las ondas
+                    // quedan pegadas arriba. El alto sobrante lo toma la fila
+                    // de paneles de deck, que lo centra dentro suyo.
+                    lane-a := Lane {
                         label: "A";
                         accent: #22d3ee;
-                        vertical-stretch: 1;
                         track-name: root.name-a;
                         bpm-text: root.bpm-a;
                         time-text: root.time-a;
                         synced: root.synced-a;
                         img: root.wave-a;
                         img-x: root.wave-a-x;
+                        loop-visible: root.loop-a-visible;
+                        loop-x: root.loop-a-x;
+                        loop-w: root.loop-a-w;
                     }
 
-                    Lane {
+                    // Zoom compacto entre las dos ondas. Alto fijo de 18 px y
+                    // posiciones explícitas: dentro de un layout los controles
+                    // de alto fijo quedan pegados arriba, y acá no puede
+                    // quedar ningún rectángulo que se lleve el alto sobrante.
+                    // Va centrado horizontalmente: a mitad de camino entre los
+                    // dos carriles se lee como control común a los dos.
+                    Rectangle {
+                        height: 18px;
+                        background: transparent;
+
+                        // − (18) + 4 + texto (44) + 4 + + (18) = 88 px
+                        Text {
+                            text: root.zoom-text;
+                            color: #8b98a8;
+                            font-size: 11px;
+                            x: (parent.width - 88px) / 2 + 22px;
+                            y: 0px;
+                            width: 44px;
+                            height: 18px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        ZoomButton {
+                            text: "−";
+                            x: (parent.width - 88px) / 2;
+                            y: 1px;
+                            clicked => { root.zoom-out(); }
+                        }
+                        ZoomButton {
+                            text: "+";
+                            x: (parent.width - 88px) / 2 + 70px;
+                            y: 1px;
+                            clicked => { root.zoom-in(); }
+                        }
+                    }
+
+                    lane-b := Lane {
                         label: "B";
                         accent: #fbbf24;
-                        vertical-stretch: 1;
                         track-name: root.name-b;
                         bpm-text: root.bpm-b;
                         time-text: root.time-b;
                         synced: root.synced-b;
                         img: root.wave-b;
                         img-x: root.wave-b-x;
+                        loop-visible: root.loop-b-visible;
+                        loop-x: root.loop-b-x;
+                        loop-w: root.loop-b-w;
                     }
                 }
             }
 
             HorizontalLayout {
                 spacing: 10px;
+                vertical-stretch: 1;
 
                 DeckPanel {
                     width: 35%;
@@ -544,6 +827,7 @@ slint::slint! {
                     playing: root.playing-a;
                     synced: root.synced-a;
                     looping: root.looping-a;
+                    loop-beats: root.loop-beats-a;
                     meter: root.meter-a;
                     pitch-pct: root.pitch-a;
                     gain: root.gain-a;
@@ -554,7 +838,8 @@ slint::slint! {
                     cue => { root.cue-a(); }
                     sync => { root.sync-a(); }
                     browse => { root.browse-a(); }
-                    loop8 => { root.loop-a(); }
+                    loop8 => { root.loop-a(8); }
+                    loop4 => { root.loop-a(4); }
                     pitch-changed(v) => { root.pitch-a = v; root.pitch-a-changed(v); }
                     pitch-reset => { root.pitch-reset-a(); }
                     gain-changed(v) => { root.gain-a = v; root.gain-a-changed(v); }
@@ -586,6 +871,7 @@ slint::slint! {
                     playing: root.playing-b;
                     synced: root.synced-b;
                     looping: root.looping-b;
+                    loop-beats: root.loop-beats-b;
                     meter: root.meter-b;
                     pitch-pct: root.pitch-b;
                     gain: root.gain-b;
@@ -596,7 +882,8 @@ slint::slint! {
                     cue => { root.cue-b(); }
                     sync => { root.sync-b(); }
                     browse => { root.browse-b(); }
-                    loop8 => { root.loop-b(); }
+                    loop8 => { root.loop-b(8); }
+                    loop4 => { root.loop-b(4); }
                     pitch-changed(v) => { root.pitch-b = v; root.pitch-b-changed(v); }
                     pitch-reset => { root.pitch-reset-b(); }
                     gain-changed(v) => { root.gain-b = v; root.gain-b-changed(v); }
@@ -633,6 +920,8 @@ struct DeckState {
     pyramid: Option<PeakPyramid>,
     syncing: bool,
     looping: bool,
+    /// Largo del loop activo en beats; 0 cuando no hay loop.
+    loop_beats: f64,
     pitch_pct: f64,
 }
 
@@ -653,6 +942,10 @@ struct WaveRender {
     center: f64,
     zoom: f64,
     rate: f64,
+    /// Resolución del bitmap con la que se dibujó, para redibujar si la ventana
+    /// cambia de tamaño.
+    lane_px: u32,
+    lane_py: u32,
     valido: bool,
 }
 
@@ -709,6 +1002,7 @@ fn main() -> Result<()> {
             pyramid: None,
             syncing: false,
             looping: false,
+            loop_beats: 0.0,
             pitch_pct: 0.0,
         },
         DeckState {
@@ -716,6 +1010,7 @@ fn main() -> Result<()> {
             pyramid: None,
             syncing: false,
             looping: false,
+            loop_beats: 0.0,
             pitch_pct: 0.0,
         },
     ]));
@@ -727,6 +1022,10 @@ fn main() -> Result<()> {
     }));
 
     let ui = AppWindow::new()?;
+    // Tamaño inicial: el layout es fluido, así que la ventana arranca en el
+    // tamaño histórico y de ahí en más manda el usuario (o el WM, si maximiza).
+    ui.window()
+        .set_size(slint::PhysicalSize::new(1240, 780));
     // DJDECK_FULLSCREEN=1 abre a pantalla completa: sirve cuando la ventana
     // aparece detrás de otras o en un escritorio que no estás mirando.
     if std::env::var("DJDECK_FULLSCREEN").is_ok() {
@@ -812,6 +1111,32 @@ fn main() -> Result<()> {
                 if el as u64 >= secs {
                     std::process::exit(0);
                 }
+            }
+        });
+    }
+
+    // ---- foto de la ventana: `DJDECK_SHOT=<ruta .bmp>` ----
+    // Una sola captura a los 1500 ms, sin herramienta de pantallazos: alcanza
+    // para mirar el layout. Sin la variable no hay hilo ni salida.
+    if let Ok(destino) = std::env::var("DJDECK_SHOT") {
+        let ui_weak = ui.as_weak();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            // `upgrade()` devuelve None fuera del hilo de la UI: la captura se
+            // pide al lazo de eventos, que es donde vive la ventana.
+            let r = ui_weak.upgrade_in_event_loop(move |ui| match ui.window().take_snapshot() {
+                Ok(foto) => {
+                    let (w, h) = (foto.width(), foto.height());
+                    let bmp = bmp_24(foto.as_slice(), w, h);
+                    match std::fs::write(&destino, bmp) {
+                        Ok(()) => println!("shot: {destino} {w}x{h}"),
+                        Err(e) => println!("shot: error {e}"),
+                    }
+                }
+                Err(e) => println!("shot: error {e}"),
+            });
+            if let Err(e) = r {
+                println!("shot: error {e}");
             }
         });
     }
@@ -928,13 +1253,17 @@ fn main() -> Result<()> {
         let controls = controls.clone();
         let decks = decks.clone();
         let ui_weak = ui.as_weak();
-        ui.on_loop_a(move || toggle_loop(controls, &decks, &ui_weak, 0, sr));
+        ui.on_loop_a(move |beats| {
+            toggle_loop(controls, &decks, &ui_weak, 0, sr, beats as f64)
+        });
     }
     {
         let controls = controls.clone();
         let decks = decks.clone();
         let ui_weak = ui.as_weak();
-        ui.on_loop_b(move || toggle_loop(controls, &decks, &ui_weak, 1, sr));
+        ui.on_loop_b(move |beats| {
+            toggle_loop(controls, &decks, &ui_weak, 1, sr, beats as f64)
+        });
     }
     {
         let view = view.clone();
@@ -1111,7 +1440,7 @@ fn main() -> Result<()> {
     // estado del botón sin clickear).
     if std::env::var("DJDECK_LOOP").is_ok() {
         let ui_weak = ui.as_weak();
-        toggle_loop(controls, &decks, &ui_weak, 0, sr);
+        toggle_loop(controls, &decks, &ui_weak, 0, sr, 8.0);
     }
 
     ui.set_gain_a(engine::get_f32(&controls.gain[0]));
@@ -1235,20 +1564,34 @@ fn main() -> Result<()> {
             let t_onda = std::time::Instant::now();
             if std::env::var("DJDECK_NO_WAVE").is_err() {
                 let zoom = view.borrow().zoom_secs;
-                let px = (LANE_W / WAVE_DIV) as f64; // ancho de un carril en píxeles
-                let frames_per_px = zoom * sr_f / px;
                 let rate = [
                     engine::get_f32(&controls.rate[0]) as f64,
                     engine::get_f32(&controls.rate[1]) as f64,
                 ];
+                // La ventana es redimensionable: el ancho sale del layout, no de
+                // una constante de diseño. Si la onda se mapeara con LANE_W, al
+                // maximizar el playhead dejaría de caer en el centro del carril.
+                let lane = [
+                    (ui.get_lane_a_w() as f64, ui.get_lane_a_h() as f64),
+                    (ui.get_lane_b_w() as f64, ui.get_lane_b_h() as f64),
+                ];
                 let mut ws = wave_state.borrow_mut();
                 for i in 0..DECK_COUNT {
+                    let (lane_w, lane_h) = lane[i];
+                    // Antes del primer layout todavía no hay carril que dibujar.
+                    if lane_w < 80.0 || lane_h < 40.0 {
+                        continue;
+                    }
+                    let (px_por_frame, frames_per_px) = wave_scale(zoom, sr_f, lane_w);
+                    let (lane_px, lane_py) = strip_size(lane_w, lane_h);
                     let src_per_px = frames_per_px * rate[i];
                     let ahora = pos[i] * sr_f;
                     let necesita = !ws[i].valido
                         || (ws[i].zoom - zoom).abs() > 1e-9
                         || (ws[i].rate - rate[i]).abs() > 1e-9
-                        || ((ahora - ws[i].center) / src_per_px).abs() > px / 2.0;
+                        || ws[i].lane_px != lane_px
+                        || ws[i].lane_py != lane_py
+                        || ((ahora - ws[i].center) / src_per_px).abs() > lane_px as f64 / 2.0;
                     if necesita {
                         let st = decks.borrow();
                         if let Some(pyr) = st[i].pyramid.as_ref() {
@@ -1260,11 +1603,15 @@ fn main() -> Result<()> {
                                 if i == 0 { (34, 211, 238) } else { (251, 191, 36) },
                                 st[i].track.as_ref().map(|t| t.grid),
                                 sr_f,
+                                lane_px,
+                                lane_py,
                             );
                             ws[i] = WaveRender {
                                 center: ahora,
                                 zoom,
                                 rate: rate[i],
+                                lane_px,
+                                lane_py,
                                 valido: true,
                             };
                             drop(st);
@@ -1280,15 +1627,42 @@ fn main() -> Result<()> {
                     // tira: hay que correr la imagen hacia la IZQUIERDA (x más
                     // negativo) para que caiga en el centro del carril.
                     let deriva = if ws[i].valido {
-                        ((ahora - ws[i].center) / src_per_px) as f32 * WAVE_DIV as f32
+                        ((ahora - ws[i].center) * px_por_frame) as f32
                     } else {
                         0.0
                     };
-                    let x = -(LANE_W as f32) - deriva;
+                    let x = -(lane_w as f32) - deriva;
                     if i == 0 {
                         ui.set_wave_a_x(x);
                     } else {
                         ui.set_wave_b_x(x);
+                    }
+
+                    // Sombra del loop. Los bordes están en frames del
+                    // dispositivo y el eje visible avanza `px_por_frame` píxeles
+                    // de pantalla por frame. Con el playhead al centro, un punto
+                    // fijo del track se corre a la izquierda a medida que el deck
+                    // avanza.
+                    let sombra = if controls.loop_on[i].load(Ordering::Relaxed) {
+                        loop_shadow(
+                            controls.loop_start[i].load(Ordering::Relaxed) as f64,
+                            controls.loop_end[i].load(Ordering::Relaxed) as f64,
+                            ahora,
+                            px_por_frame,
+                            lane_w,
+                        )
+                    } else {
+                        None
+                    };
+                    let (sx, sw) = sombra.unwrap_or((0.0, 0.0));
+                    if i == 0 {
+                        ui.set_loop_a_visible(sombra.is_some());
+                        ui.set_loop_a_x(sx);
+                        ui.set_loop_a_w(sw);
+                    } else {
+                        ui.set_loop_b_visible(sombra.is_some());
+                        ui.set_loop_b_x(sx);
+                        ui.set_loop_b_w(sw);
                     }
                 }
             }
@@ -1492,47 +1866,130 @@ fn toggle_sync(decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>, ui: &slint::Weak<Ap
     }
 }
 
-/// LOOP 8: engancha 8 beats desde el beat que contiene la posición actual.
-/// Al activarse, el motor envuelve dentro del rango con un fade de 2 ms.
+/// Ventana de loop de `beats` beats, enganchada al beat que contiene `pos`
+/// (frames del dispositivo). Devuelve (inicio, fin) en frames, recortado al
+/// final del track, o `None` si el rango quedaría degenerado.
+fn loop_window(
+    beat_len: f64,
+    first_beat: f64,
+    pos: f64,
+    sr: u32,
+    frames: f64,
+    beats: f64,
+) -> Option<(f64, f64)> {
+    let beat_frames = beat_len * sr as f64;
+    if beat_frames < 2.0 || beats < 1.0 {
+        return None;
+    }
+    let rel_beats = (pos / sr as f64 - first_beat) / beat_len;
+    let beat_k = rel_beats.floor().max(0.0);
+    let start = ((first_beat + beat_k * beat_len) * sr as f64).max(0.0);
+    let end = (start + beats * beat_frames).min(frames - 1.0);
+    if end <= start + 2.0 {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Rectángulo en píxeles de pantalla que ocupa el loop sobre el carril de onda.
+/// El carril muestra la posición actual en su centro y la tira se corre a la
+/// izquierda a medida que el deck avanza, así que un tramo fijo del track se
+/// desplaza: `x` se recorta al carril y `w` nunca queda negativa.
+fn loop_shadow(
+    loop_start: f64,
+    loop_end: f64,
+    ahora: f64,
+    px_por_frame: f64,
+    lane_w: f64,
+) -> Option<(f32, f32)> {
+    if px_por_frame <= 0.0 || loop_end <= loop_start {
+        return None;
+    }
+    let medio = lane_w / 2.0;
+    let x0 = medio + (loop_start - ahora) * px_por_frame;
+    let x1 = medio + (loop_end - ahora) * px_por_frame;
+    let x = x0.max(0.0);
+    let w = x1.min(lane_w) - x;
+    if w < 1.0 {
+        return None;
+    }
+    Some((x as f32, w as f32))
+}
+
+/// Escala del eje de tiempo del carril visible: (píxeles de pantalla por frame
+/// del dispositivo, frames por píxel del bitmap). Depende del ancho REAL del
+/// carril y no de la resolución del bitmap: por eso al maximizar la ventana la
+/// onda sigue alineada con el playhead y con la sombra del loop.
+fn wave_scale(zoom: f64, sr: f64, lane_w: f64) -> (f64, f64) {
+    let px_por_frame = lane_w / (zoom * sr);
+    let frames_por_px = zoom * sr / (lane_w / WAVE_DIV as f64);
+    (px_por_frame, frames_por_px)
+}
+
+/// Resolución del bitmap de una tira de onda: (ancho de un carril, alto) en
+/// píxeles, con la misma densidad que el carril en pantalla (1 píxel de bitmap
+/// cada WAVE_DIV de pantalla). Con tamaño fijo, maximizar estiraba el bitmap y
+/// la onda se veía borrosa. Los topes evitan que una ventana enorme dispare el
+/// costo del redibujado, que es todo el costo del tick de UI.
+fn strip_size(lane_w: f64, lane_h: f64) -> (u32, u32) {
+    let w = (lane_w / WAVE_DIV as f64).round() as i64;
+    let h = (lane_h / WAVE_DIV as f64).round() as i64;
+    (
+        w.clamp((LANE_W / WAVE_DIV) as i64, 4096) as u32,
+        h.clamp(LANE_MIN_PY, 1024) as u32,
+    )
+}
+
+/// LOOP 4 / LOOP 8: engancha `beats` beats desde el beat que contiene la
+/// posición actual. Al activarse, el motor envuelve dentro del rango con un
+/// fade de 2 ms. Con un loop activo, pulsar el mismo largo lo apaga y pulsar
+/// el otro largo lo reemplaza sin pasar por apagado.
 fn toggle_loop(
     controls: &Controls,
     decks: &Rc<RefCell<[DeckState; DECK_COUNT]>>,
     ui: &slint::Weak<AppWindow>,
     deck: usize,
     sr: u32,
+    beats: f64,
 ) {
     let mut st = decks.borrow_mut();
-    if st[deck].looping {
+    let mut on;
+    if st[deck].looping && st[deck].loop_beats == beats {
         st[deck].looping = false;
+        st[deck].loop_beats = 0.0;
         controls.loop_on[deck].store(false, Ordering::Relaxed);
+        on = false;
     } else {
         let Some(track) = st[deck].track.clone() else {
             return;
         };
-        let beat_frames = track.grid.beat_len() * sr as f64;
-        if beat_frames < 2.0 {
-            return;
-        }
         let pos = controls.position[deck].load(Ordering::Relaxed) as f64;
-        let rel_beats = (pos / sr as f64 - track.grid.first_beat) / track.grid.beat_len();
-        let beat_k = rel_beats.floor().max(0.0);
-        let start = ((track.grid.first_beat + beat_k * track.grid.beat_len()) * sr as f64).max(0.0);
-        let end = (start + 8.0 * beat_frames).min(track.frames() as f64 - 1.0);
-        if end <= start + 2.0 {
+        let Some((start, end)) = loop_window(
+            track.grid.beat_len(),
+            track.grid.first_beat,
+            pos,
+            sr,
+            track.frames() as f64,
+            beats,
+        ) else {
             return;
-        }
+        };
         controls.loop_start[deck].store(start as u64, Ordering::Relaxed);
         controls.loop_end[deck].store(end as u64, Ordering::Relaxed);
         controls.loop_on[deck].store(true, Ordering::Relaxed);
         st[deck].looping = true;
+        st[deck].loop_beats = beats;
+        on = true;
     }
-    let on = st[deck].looping;
     drop(st);
     if let Some(ui) = ui.upgrade() {
+        let largo = if on { beats.round() as i32 } else { 0 };
         if deck == 0 {
             ui.set_looping_a(on);
+            ui.set_loop_beats_a(largo);
         } else {
             ui.set_looping_b(on);
+            ui.set_loop_beats_b(largo);
         }
     }
 }
@@ -1582,10 +2039,14 @@ fn render_lane(
     rgb: (u8, u8, u8),
     grid: Option<BeatGrid>,
     sr: f64,
+    lane_px: u32,
+    lane_py: u32,
 ) -> Image {
     // Tira de STRIP carriles de ancho: el `Image` se dibuja 3 veces más ancho que
     // el carril y se desplaza, así redibujar es cosa de ~2 veces por segundo.
-    let (w, h) = (LANE_W / WAVE_DIV * STRIP, LANE_H);
+    // El tamaño sale del carril real: al maximizar la ventana la onda se redibuja
+    // a esa resolución en vez de estirar un bitmap chico.
+    let (w, h) = (lane_px * STRIP, lane_py);
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
     let mid_y = h as f32 / 2.0;
     let mid_x = w as f32 / 2.0;
@@ -1674,23 +2135,6 @@ fn render_lane(
                         }
                     }
                 }
-            }
-        }
-
-        // Playhead al centro: la referencia vertical de las dos lanes.
-        for dx in 0..2u32 {
-            let x = (mid_x as u32).saturating_sub(1) + dx;
-            if x >= w {
-                continue;
-            }
-            for y in 0..h {
-                let idx = (y * w + x) as usize;
-                pixels[idx] = Rgba8Pixel {
-                    r: 240,
-                    g: 245,
-                    b: 250,
-                    a: 255,
-                };
             }
         }
     }
@@ -2095,6 +2539,40 @@ fn cargar_para_motor(pedido: &str, sr: u32) -> Result<Arc<Track>> {
     )))
 }
 
+/// Arma un BMP de 24 bits sin comprimir a mano: 14 bytes de BITMAPFILEHEADER +
+/// 40 de BITMAPINFOHEADER, filas de abajo hacia arriba y cada fila rellenada a
+/// múltiplo de 4 bytes. Entra RGBA y sale BGR porque el BMP no lleva alfa; se
+/// hace acá para no sumar una dependencia de imágenes.
+fn bmp_24(rgba: &[Rgba8Pixel], w: u32, h: u32) -> Vec<u8> {
+    let fila = (w as usize * 3).div_ceil(4) * 4; // relleno a 4 bytes por fila
+    let imagen = fila * h as usize;
+    let mut out = Vec::with_capacity(54 + imagen);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + imagen) as u32).to_le_bytes()); // tamaño del archivo
+    out.extend_from_slice(&0u32.to_le_bytes()); // reservado
+    out.extend_from_slice(&54u32.to_le_bytes()); // offset de los píxeles
+    out.extend_from_slice(&40u32.to_le_bytes()); // tamaño del BITMAPINFOHEADER
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes()); // alto positivo: abajo hacia arriba
+    out.extend_from_slice(&1i16.to_le_bytes()); // planos
+    out.extend_from_slice(&24i16.to_le_bytes()); // bits por píxel
+    out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB: sin compresión
+    out.extend_from_slice(&(imagen as u32).to_le_bytes());
+    out.extend_from_slice(&2835i32.to_le_bytes()); // 72 ppp en X
+    out.extend_from_slice(&2835i32.to_le_bytes()); // 72 ppp en Y
+    out.extend_from_slice(&0u32.to_le_bytes()); // colores en la paleta
+    out.extend_from_slice(&0u32.to_le_bytes()); // colores importantes
+    let relleno = [0u8; 3];
+    for y in (0..h).rev() {
+        let base = y as usize * w as usize;
+        for px in rgba[base..base + w as usize].iter() {
+            out.extend_from_slice(&[px.b, px.g, px.r]);
+        }
+        out.extend_from_slice(&relleno[..fila - w as usize * 3]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod demo_tests {
     use super::*;
@@ -2200,5 +2678,169 @@ mod demo_tests {
             ratio > 1e-3,
             "el demo debe tener ancho estéreo real, energía L-R / L = {ratio:e}"
         );
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    /// 120 BPM: un beat dura medio segundo y la rejilla arranca en 0.
+    const BEAT: f64 = 0.5;
+
+    fn frames(secs: f64) -> f64 {
+        secs * 48_000.0
+    }
+
+    #[test]
+    fn loop_de_4_beats_mide_dos_segundos() {
+        let sr = 48_000;
+        let (start, end) = loop_window(BEAT, 0.0, frames(1.7), sr, frames(60.0), 4.0).unwrap();
+        assert!(
+            (start - frames(1.5)).abs() < 1.0,
+            "arranca en el beat que contiene la posición (1.5 s): {start}"
+        );
+        assert!(
+            ((end - start) - frames(2.0)).abs() < 1.0,
+            "4 beats de 0.5 s miden 2 s: {}",
+            end - start
+        );
+    }
+
+    #[test]
+    fn loop_de_8_beats_mide_el_doble_que_el_de_4() {
+        let sr = 48_000;
+        let pos = frames(1.7);
+        let track = frames(60.0);
+        let (s4, e4) = loop_window(BEAT, 0.0, pos, sr, track, 4.0).unwrap();
+        let (s8, e8) = loop_window(BEAT, 0.0, pos, sr, track, 8.0).unwrap();
+        assert!((s4 - s8).abs() < 1.0, "los dos largos arrancan en el mismo beat");
+        assert!(
+            ((e8 - s8) - 2.0 * (e4 - s4)).abs() < 1.0,
+            "8 beats miden el doble que 4: {} vs {}",
+            e8 - s8,
+            e4 - s4
+        );
+    }
+
+    #[test]
+    fn la_rejilla_desplazada_alinea_al_beat() {
+        let sr = 48_000;
+        // Rejilla con primer beat en 0.25 s: el loop tiene que caer en la
+        // rejilla, no en el cero absoluto.
+        let (start, _) = loop_window(BEAT, 0.25, frames(1.7), sr, frames(60.0), 4.0).unwrap();
+        let beat_rel = (start / frames(1.0) - 0.25) / BEAT;
+        assert!(
+            (beat_rel - beat_rel.round()).abs() < 1e-6,
+            "el borde del loop no cae en un beat de la rejilla: {beat_rel}"
+        );
+        assert!((start - frames(1.25)).abs() < 1.0, "beat 2 de la rejilla: {start}");
+    }
+
+    #[test]
+    fn el_loop_se_recorta_al_final_del_track() {
+        let sr = 48_000;
+        let track = frames(3.0);
+        let (start, end) = loop_window(BEAT, 0.0, frames(2.6), sr, track, 8.0).unwrap();
+        assert!(end <= track - 1.0, "no pasa del último frame: {end}");
+        assert!(end > start + frames(0.1), "queda algo de loop: {}", end - start);
+    }
+
+    #[test]
+    fn sin_material_utilizable_no_hay_loop() {
+        let sr = 48_000;
+        assert!(loop_window(0.0, 0.0, frames(1.0), sr, frames(60.0), 4.0).is_none());
+        assert!(loop_window(BEAT, 0.0, frames(1.0), sr, frames(60.0), 0.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod loop_shadow_tests {
+    use super::*;
+
+    const LANE: f64 = 1000.0;
+
+    #[test]
+    fn el_loop_centrado_ocupa_el_medio_del_carril() {
+        // 200 frames de loop, 1 px por frame, playhead justo en el centro del
+        // loop: la sombra arranca 100 px a la izquierda del centro.
+        let (x, w) = loop_shadow(1_900.0, 2_100.0, 2_000.0, 1.0, LANE).unwrap();
+        assert!((x - 400.0).abs() < 1e-3, "x: {x}");
+        assert!((w - 200.0).abs() < 1e-3, "ancho: {w}");
+    }
+
+    #[test]
+    fn la_sombra_se_corre_con_el_deck() {
+        // Al avanzar el deck, el mismo tramo se va hacia la izquierda.
+        let (x_antes, _) = loop_shadow(1_900.0, 2_100.0, 2_000.0, 1.0, LANE).unwrap();
+        let (x_despues, w) = loop_shadow(1_900.0, 2_100.0, 2_100.0, 1.0, LANE).unwrap();
+        assert!(x_despues < x_antes, "se corre a la izquierda: {x_antes} -> {x_despues}");
+        assert!((w - 200.0).abs() < 1e-3, "el ancho no cambia: {w}");
+    }
+
+    #[test]
+    fn el_recorte_al_borde_no_inventa_ancho() {
+        // Ya casi salió por la izquierda: lo que queda se recorta al carril.
+        let (x, w) = loop_shadow(1_900.0, 2_100.0, 2_500.0, 1.0, LANE).unwrap();
+        assert!(x >= 0.0, "x nunca negativo: {x}");
+        assert!((w - 100.0).abs() < 1e-3, "sólo queda la cola visible: {w}");
+    }
+
+    #[test]
+    fn un_loop_fuera_del_carril_no_dibuja_sombra() {
+        assert!(loop_shadow(1_900.0, 2_100.0, 4_000.0, 1.0, LANE).is_none());
+        assert!(loop_shadow(1_900.0, 2_100.0, 2_000.0, 0.0, LANE).is_none());
+        assert!(loop_shadow(2_100.0, 1_900.0, 2_000.0, 1.0, LANE).is_none());
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    const SR: f64 = 48_000.0;
+
+    /// La ley que hace que al maximizar no se rompa nada: un tramo de audio
+    /// ocupa siempre `ancho_del_carril * segundos / zoom` píxeles, sin importar
+    /// el tamaño de la ventana ni la resolución del bitmap.
+    #[test]
+    fn un_segundo_ocupa_lo_mismo_en_cualquier_tamano() {
+        for lane_w in [1180.0, 1900.0, 2560.0] {
+            let (px_por_frame, _) = wave_scale(8.0, SR, lane_w);
+            let segundos_por_px = 1.0 / (SR * px_por_frame);
+            let px_de_2s = 2.0 / segundos_por_px;
+            assert!(
+                (px_de_2s - lane_w * 2.0 / 8.0).abs() < 0.5,
+                "con zoom 8 s, 2 s deben medir un cuarto del carril ({lane_w} px): {px_de_2s}"
+            );
+        }
+    }
+
+    /// El ancho de la sombra tiene que seguir a la escala del carril: si se
+    /// dibujara con la constante de diseño, al maximizar marcaría otro tramo.
+    #[test]
+    fn la_sombra_usa_el_ancho_real_del_carril() {
+        let (px_por_frame, _) = wave_scale(8.0, SR, 2560.0);
+        let dos_seg = 2.0 * SR;
+        let (x, w) = loop_shadow(10.0 * SR, 12.0 * SR, 11.0 * SR, px_por_frame, 2560.0).unwrap();
+        assert!((w - 640.0).abs() < 0.5, "2 s de 8 son 640 px de 2560: {w}");
+        assert!((x - (1280.0 - 320.0)).abs() < 0.5, "centrado en el playhead: {x}");
+        assert!(dos_seg > 0.0);
+    }
+
+    /// El bitmap acompaña al carril con la misma densidad: si no, maximizar
+    /// estira un bitmap chico y la onda se ve borrosa.
+    #[test]
+    fn el_bitmap_conserva_la_densidad_al_maximizar() {
+        let (w_chico, h_chico) = strip_size(1180.0, 216.0);
+        let (w_grande, h_grande) = strip_size(2560.0, 700.0);
+        assert_eq!((w_chico, h_chico), (590, 108));
+        assert_eq!((w_grande, h_grande), (1280, 350));
+    }
+
+    #[test]
+    fn el_bitmap_tiene_piso_para_ventanas_angostas() {
+        let (w, h) = strip_size(200.0, 30.0);
+        assert_eq!((w, h), (LANE_W / WAVE_DIV, LANE_MIN_PY as u32));
     }
 }
