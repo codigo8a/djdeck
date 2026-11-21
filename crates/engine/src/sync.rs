@@ -91,6 +91,17 @@ pub const PHASE_DEADBAND: f64 = 0.004;
 pub const PHASE_GAIN: f64 = 0.55;
 pub const PHASE_MAX_REL: f64 = 0.03;
 
+/// Rate relativo que sólo iguala tempo, sin corrección de fase. Es lo que
+/// corresponde mientras el deck esclavo está pausado: su posición no avanza,
+/// así que corregir fase sólo barre el rate entre ±PHASE_MAX_REL a la
+/// frecuencia del beat (medido: de -2.9 % a +3.1 % cada 0.46 s).
+pub fn tempo_relative_rate(master_bpm: f64, slave_bpm: f64, max_rel: f64) -> f64 {
+    match tempo_rate(master_bpm, slave_bpm, max_rel) {
+        Some((tempo, _)) => tempo,
+        None => 1.0,
+    }
+}
+
 /// Un paso de sync: primero tempo, después fase. Devuelve el rate relativo a
 /// aplicar al deck esclavo en este tick de control.
 pub fn sync_relative_rate(

@@ -210,6 +210,37 @@ fn sync_rechaza_tempo_fuera_de_rango() {
     assert!((rate - 2.0).abs() < 1e-9 || (rate - 1.0).abs() < 1e-9, "rate={rate}");
 }
 
+/// El deck con SYNC pausado no avanza, así que corregir fase lo único que hace
+/// es barrer el rate de -3 % a +3 % a la frecuencia del beat. Estando pausado
+/// sólo se iguala tempo: el rate queda fijo y el pitch no se mueve.
+#[test]
+fn sync_con_el_esclavo_pausado_solo_iguala_tempo() {
+    let master = BeatGrid::new(125.1, 0.220);
+    let slave = BeatGrid::new(125.0, 0.475);
+    let slave_pos = 3.0; // congelada: el deck está en pause
+
+    let fijo = sync::tempo_relative_rate(master.bpm, slave.bpm, sync::DEFAULT_MAX_REL);
+    assert!((fijo - 125.1 / 125.0).abs() < 1e-12, "tempo {fijo}");
+
+    // Contraprueba del bug: con la corrección de fase el rate se va de -2.9 % a
+    // +3.1 % sólo porque el master sigue avanzando.
+    let (mut min, mut max) = (f64::MAX, f64::MIN);
+    for k in 0..600 {
+        let master_pos = k as f64 * 0.066;
+        let (rate, _) = sync::sync_relative_rate(master_pos, master, slave_pos, slave, sync::DEFAULT_MAX_REL);
+        min = min.min(rate);
+        max = max.max(rate);
+        // Lo que se aplica ahora con el deck pausado: constante.
+        assert!((sync::tempo_relative_rate(master.bpm, slave.bpm, sync::DEFAULT_MAX_REL) - fijo).abs() < 1e-12);
+    }
+    assert!(
+        max - min > 0.05,
+        "la corrección de fase debería barrer el rate (min {min}, max {max})"
+    );
+    // Fuera de rango no hay tempo que igualar: rate neutro.
+    assert_eq!(sync::tempo_relative_rate(128.0, 100.0, sync::DEFAULT_MAX_REL), 1.0);
+}
+
 #[test]
 fn seek_salta_a_la_posicion_pedida() {
     let mut h = Harness::new();

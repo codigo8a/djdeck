@@ -1543,8 +1543,24 @@ fn main() -> Result<()> {
                     )
                 };
                 if let (true, Some(my_grid), Some(other_grid)) = (want, my_grid, other_grid) {
-                    let (rate, _) =
-                        sync::sync_relative_rate(pos[other], other_grid, pos[i], my_grid, 0.08);
+                    // Corregir fase exige posiciones REALES y el deck andando:
+                    //  - pausado, su posición está congelada y la corrección
+                    //    barría el rate de -2.9 % a +3.1 % a la frecuencia del
+                    //    beat (el pitch "enloquecido" al dar pause);
+                    //  - si el motor todavía no cargó los temas (length 0) la
+                    //    posición que se lee es 0 y el lazo persigue un beat
+                    //    fantasma.
+                    // En los dos casos se iguala tempo y nada más: al reanudar
+                    // o al terminar la carga, el BPM ya está alineado.
+                    let motor_listo = controls.length[i].load(Ordering::Relaxed) > 0
+                        && controls.length[other].load(Ordering::Relaxed) > 0;
+                    let corrige_fase =
+                        motor_listo && controls.playing[i].load(Ordering::Relaxed);
+                    let rate = if corrige_fase {
+                        sync::sync_relative_rate(pos[other], other_grid, pos[i], my_grid, 0.08).0
+                    } else {
+                        sync::tempo_relative_rate(other_grid.bpm, my_grid.bpm, 0.08)
+                    };
                     engine::set_f32(&controls.rate[i], rate as f32);
                 } else if want {
                     // Sync sin las dos rejillas: el lazo no puede correr. Se apaga
