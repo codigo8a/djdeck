@@ -48,10 +48,12 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
   apagarlo devuelve el deck a la posición de su fader en vez de dejarlo desafinado. Sólo puede haber
   un deck sincronizado: encender uno apaga el otro, porque dos lazos cruzados se pelean y dejan los
   dos decks clavados en ±3 % (medido: 0.9689 y 1.0311 sin converger). La corrección de fase sólo
-  corre con el deck sonando y con los dos temas ya cargados en el motor: en pause su posición no
-  avanza y corregir fase barría el rate de −2.9 % a +3.1 % cada beat (medido), y con el motor todavía
-  cargando la posición que se lee es 0. En esos casos se iguala tempo y nada más, así al reanudar
-  arranca al BPM correcto y converge la fase en ~2 s (medido: 3.1 % → 0.1 %).
+  corre con los DOS decks sonando y con los dos temas cargados en el motor. Si cualquiera está en
+  pause su fase queda congelada, el otro la recorre a un beat por ciclo y el rate barre de −2.9 % a
+  +3.1 % cada 0.46 s (medido): eso es la distorsión que se escuchaba con el sync en un deck y el otro
+  detenido. En esos casos se iguala **tempo** y nada más —rate fijo, medido +0.1 % con el master en
+  pause— y la fase engancha sola al arrancar el otro deck (medido: −2.9 % → 0 en ~5 s). Con el motor
+  todavía cargando la posición que se lee es 0, así que tampoco se corrige fase.
 - Análisis al cargar: BPM y fase de la rejilla por autocorrelación de la envolvente de onsets.
 - Salida de audio por `cpal` a 48 kHz, bloques de 256 frames (5.3 ms).
 

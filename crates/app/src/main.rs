@@ -1543,19 +1543,24 @@ fn main() -> Result<()> {
                     )
                 };
                 if let (true, Some(my_grid), Some(other_grid)) = (want, my_grid, other_grid) {
-                    // Corregir fase exige posiciones REALES y el deck andando:
-                    //  - pausado, su posición está congelada y la corrección
-                    //    barría el rate de -2.9 % a +3.1 % a la frecuencia del
-                    //    beat (el pitch "enloquecido" al dar pause);
-                    //  - si el motor todavía no cargó los temas (length 0) la
-                    //    posición que se lee es 0 y el lazo persigue un beat
-                    //    fantasma.
-                    // En los dos casos se iguala tempo y nada más: al reanudar
-                    // o al terminar la carga, el BPM ya está alineado.
+                    // Corregir fase exige posiciones REALES y los DOS decks
+                    // andando. Si cualquiera está en pause su fase queda
+                    // congelada, el otro la recorre a un beat por ciclo y el
+                    // rate se va de -3 % a +3 % a ~2 Hz: medido -2.9 %/+3.1 %
+                    // cada 0.46 s, audible como distorsión. Si el motor todavía
+                    // no cargó los temas (length 0) la posición que se lee es 0
+                    // y el lazo persigue un beat fantasma. En todos esos casos
+                    // se iguala tempo y nada más: el BPM queda alineado y la
+                    // fase engancha sola cuando los dos están sonando.
+                    // Con el MASTER en pause pasa lo mismo por el otro lado: su
+                    // fase queda congelada, el esclavo la recorre a un beat por
+                    // ciclo y el rate se va de -3 % a +3 % a 2 Hz (audible como
+                    // distorsión). Se corrige fase sólo con los dos sonando.
                     let motor_listo = controls.length[i].load(Ordering::Relaxed) > 0
                         && controls.length[other].load(Ordering::Relaxed) > 0;
-                    let corrige_fase =
-                        motor_listo && controls.playing[i].load(Ordering::Relaxed);
+                    let corrige_fase = motor_listo
+                        && controls.playing[i].load(Ordering::Relaxed)
+                        && controls.playing[other].load(Ordering::Relaxed);
                     let rate = if corrige_fase {
                         sync::sync_relative_rate(pos[other], other_grid, pos[i], my_grid, 0.08).0
                     } else {
