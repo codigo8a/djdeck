@@ -29,10 +29,11 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
   entre los dos carriles, no arriba: así las ondas quedan pegadas al borde superior y no se come alto.
   La ventana es fluida: no declara `width`/`height` en Slint (eso clavaba el contenido y al maximizar
   dejaba una banda muerta); el tamaño inicial lo fija Rust con `window().set_size()`.
-- Pitch fader ±8 % (modo vinilo: cambia tempo *y* tono — ver deudas). **Doble click en el fader
-  vuelve a 0 % en el centro**; si ese deck estaba en SYNC, el doble click apaga su SYNC, porque el
-  lazo de sync reescribe el rate a 30 Hz y el 0 % no duraría un frame. Con SYNC activo el fader y el
-  texto se mueven con el lazo: muestra el % real que aplicó el sync y el BPM destino (`126.2 → 131.9`).
+- Perilla redonda de pitch ±8 % (modo vinilo: cambia tempo *y* tono — ver deudas). Se arrastra en
+  vertical (220 px de recorrido completo) y **el doble click la vuelve a 0 %**; si ese deck estaba en
+  SYNC, el doble click apaga su SYNC, porque el lazo de sync reescribe el rate a 15 Hz y el 0 % no
+  duraría un frame. Con SYNC activo la perilla y el texto se mueven con el lazo: muestra el % real que
+  aplicó el sync y el BPM destino (`126.2 → 131.9`).
 - `LOOP 4` / `LOOP 8`: enganchan 4 u 8 beats desde el beat que contiene la posición actual y envuelven
   con un fade de 2 ms en el borde (medido: el salto máximo entre muestras en el loop queda bajo 0.05,
   sin click). Con un loop activo, pulsar el mismo largo lo apaga; pulsar el otro largo lo reemplaza.
@@ -46,8 +47,13 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
   metía un click en los graves (medido sin rampa: el salto entre muestras a 100 Hz era 3.6× el
   natural; con rampa queda 1.0×). Costo medido del EQ: 19 ns por frame estéreo = 0.020 ms por bloque
   de 1024 frames, contra un período de 21.3 ms (0.1 %); en bypass 3.8 ns/frame. Bypass exacto
-  (bit-idéntico) cuando las tres están en 0 dB.
-- Gain por canal + crossfader equal-power (−3 dB en el centro) + limitador suave.
+  (bit-idéntico) cuando las tres están en 0 dB. Las perillas de LOW/MID/HIGH giran en el mismo
+  sentido que la de pitch (horario al subir), el doble click las vuelve a 0 dB y **al cargar un tema
+  en un deck todas las perillas de ese deck vuelven a su centro** (pitch a 0 %, EQ a 0 dB) junto con
+  el motor.
+- Gain por canal + crossfader equal-power (−3 dB en el centro) + limitador suave. El crossfader es
+  del mismo tipo que la perilla de pitch (tirador rectangular, relleno desde el centro y marca del
+  valor por defecto) y el doble click lo vuelve al centro.
 - Sync: iguala tempo (relación de BPM, recortada a ±8 %) y corrige fase contra el otro deck
   con un offset de rate de hasta ±3 %, con deadband de 0.004 beat para no vibrar. El SYNC de un deck
   sólo enciende si **los dos** decks tienen tema cargado (el lazo necesita las dos rejillas; con una

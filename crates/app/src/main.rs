@@ -321,6 +321,108 @@ slint::slint! {
         }
     }
 
+    // Perilla redonda: se arrastra en vertical (220 px de recorrido completo) y
+    // el doble click vuelve al valor por defecto (el centro). Igual que el Fader
+    // no asigna `value` por dentro: sólo emite `changed`, así el motor sigue
+    // siendo la fuente de verdad (con SYNC el lazo manda el pitch).
+    component Knob inherits Rectangle {
+        in property <float> minimum: -26.0;
+        in property <float> maximum: 12.0;
+        in property <float> reset-value: 0.0;
+        in property <color> accent: #0f6b7a;
+        in-out property <float> value: 0.0;
+        callback changed(float);
+        callback reset();
+
+        width: 34px;
+        height: 34px;
+        background: transparent;
+
+        // Recorrido de 240°: -120° en el mínimo (abajo a la izquierda), 0° en el
+        // centro (arriba) y +120° en el máximo (abajo a la derecha). Gira en
+        // sentido horario al subir, como una perilla de verdad. Math.sin/cos
+        // piden un ángulo, así que va en grados y se marca con 1deg.
+        property <float> span: Math.max(root.maximum - root.minimum, 0.000001);
+        property <float> frac: Math.min(1.0, Math.max(0.0, (root.value - root.minimum) / root.span));
+        property <float> frac-reset: Math.min(1.0, Math.max(0.0, (root.reset-value - root.minimum) / root.span));
+        property <float> ang: -120.0 + 240.0 * root.frac;
+        property <float> ang-reset: -120.0 + 240.0 * root.frac-reset;
+        property <length> radio: root.width / 2;
+        property <length> punta-x: root.radio + (root.radio - 7px) * Math.sin(root.ang * 1deg);
+        property <length> punta-y: root.radio - (root.radio - 7px) * Math.cos(root.ang * 1deg);
+        property <length> marca-x: root.radio + (root.radio - 2px) * Math.sin(root.ang-reset * 1deg);
+        property <length> marca-y: root.radio - (root.radio - 2px) * Math.cos(root.ang-reset * 1deg);
+
+        // cuerpo
+        Rectangle {
+            x: 1px;
+            y: 1px;
+            width: root.width - 2px;
+            height: root.height - 2px;
+            border-radius: root.radio;
+            background: #151c24;
+            border-width: 1px;
+            border-color: #2b3644;
+        }
+
+        // marca del valor por defecto, sobre el aro y en su ángulo (en el pitch
+        // cae arriba porque el centro del recorrido es 0 %; en el EQ cae donde
+        // está 0 dB, no arriba)
+        Rectangle {
+            x: root.marca-x - 2px;
+            y: root.marca-y - 2px;
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: #66727f;
+        }
+
+        // puntero: dos puntos sobre la misma recta, el de la punta más grande
+        Rectangle {
+            x: root.radio + (root.radio - 14px) * Math.sin(root.ang * 1deg) - 1.5px;
+            y: root.radio - (root.radio - 14px) * Math.cos(root.ang * 1deg) - 1.5px;
+            width: 3px;
+            height: 3px;
+            border-radius: 1.5px;
+            background: root.accent.with-alpha(0.55);
+        }
+        Rectangle {
+            x: root.punta-x - 2.5px;
+            y: root.punta-y - 2.5px;
+            width: 5px;
+            height: 5px;
+            border-radius: 2.5px;
+            background: root.accent;
+        }
+
+        // eje
+        Rectangle {
+            x: root.radio - 2px;
+            y: root.radio - 2px;
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: #93a0af;
+        }
+
+        // valor al empezar el arrastre: `moved` da la posición absoluta desde el
+        // press, así el gesto no acumula errores ni depende del primer evento.
+        property <float> base: 0.0;
+        property <float> paso: root.span / 220.0;
+
+        touch := TouchArea {
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    root.base = root.value;
+                }
+            }
+            moved => {
+                root.changed(Math.min(root.maximum, Math.max(root.minimum, root.base + (self.pressed-y - self.mouse-y) / 1px * root.paso)));
+            }
+            double-clicked => { root.reset(); }
+        }
+    }
+
     // Iconos: paths de Material Symbols (Apache-2.0, Google LLC), variante
     // rounded rellena. Origen y licencia en crates/app/icons/NOTICE.md.
     // Van como `Path` con viewbox 24x24 y no como glifos de texto porque el
@@ -535,15 +637,16 @@ slint::slint! {
             HorizontalLayout {
                 spacing: 6px;
                 Text { text: "PITCH"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
-                Fader {
+                Knob {
                     minimum: -8.0;
                     maximum: 8.0;
                     reset-value: 0.0;
                     accent: root.accent;
                     value: root.pitch-pct;
-                    changed(v) => { root.pitch-changed(v); }
+                    changed(v) => { root.pitch-pct = v; root.pitch-changed(v); }
                     reset => { root.pitch-reset(); }
                 }
+                Rectangle { horizontal-stretch: 1; }
                 Text { text: root.pitch-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
@@ -560,30 +663,48 @@ slint::slint! {
             HorizontalLayout {
                 spacing: 6px;
                 Text { text: "LOW"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
-                Slider {
-                    minimum: -26.0; maximum: 12.0; value: root.eq-low;
+                Knob {
+                    minimum: -26.0;
+                    maximum: 12.0;
+                    reset-value: 0.0;
+                    accent: root.accent;
+                    value: root.eq-low;
                     changed(v) => { root.eq-low = v; root.eq-low-changed(v); }
+                    reset => { root.eq-low = 0.0; root.eq-low-changed(0.0); }
                 }
+                Rectangle { horizontal-stretch: 1; }
                 Text { text: root.low-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             HorizontalLayout {
                 spacing: 6px;
                 Text { text: "MID"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
-                Slider {
-                    minimum: -26.0; maximum: 12.0; value: root.eq-mid;
+                Knob {
+                    minimum: -26.0;
+                    maximum: 12.0;
+                    reset-value: 0.0;
+                    accent: root.accent;
+                    value: root.eq-mid;
                     changed(v) => { root.eq-mid = v; root.eq-mid-changed(v); }
+                    reset => { root.eq-mid = 0.0; root.eq-mid-changed(0.0); }
                 }
+                Rectangle { horizontal-stretch: 1; }
                 Text { text: root.mid-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             HorizontalLayout {
                 spacing: 6px;
                 Text { text: "HIGH"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
-                Slider {
-                    minimum: -26.0; maximum: 12.0; value: root.eq-high;
+                Knob {
+                    minimum: -26.0;
+                    maximum: 12.0;
+                    reset-value: 0.0;
+                    accent: root.accent;
+                    value: root.eq-high;
                     changed(v) => { root.eq-high = v; root.eq-high-changed(v); }
+                    reset => { root.eq-high = 0.0; root.eq-high-changed(0.0); }
                 }
+                Rectangle { horizontal-stretch: 1; }
                 Text { text: root.high-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
             }
         }
@@ -635,9 +756,14 @@ slint::slint! {
             HorizontalLayout {
                 spacing: 6px;
                 Text { text: "A"; color: #22d3ee; font-size: 12px; font-weight: 800; vertical-alignment: center; }
-                Slider {
-                    minimum: 0.0; maximum: 1.0; value: root.xf;
+                Fader {
+                    minimum: 0.0;
+                    maximum: 1.0;
+                    reset-value: 0.5;
+                    accent: #93a0af;
+                    value: root.xf;
                     changed(v) => { root.xf = v; root.xf-changed(v); }
+                    reset => { root.xf = 0.5; root.xf-changed(0.5); }
                 }
                 Text { text: "B"; color: #fbbf24; font-size: 12px; font-weight: 800; vertical-alignment: center; }
             }
