@@ -17,9 +17,14 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
   kicks de los dos temas caen en la misma vertical. La ventana es redimensionable: el eje de
   tiempo se mapea con el ancho **real** del carril (medido por el layout), no con una constante,
   así que al maximizar el playhead sigue en el centro y la onda se redibuja a la resolución del
-  carril nuevo en vez de estirar un bitmap chico. Cada carril mide **90 px de alto** y no estira
-  con la ventana: el alto extra va a los paneles de deck y al mixer, que centran su contenido. El
-  playhead es un rectángulo fijo de la UI, no parte del bitmap: la tira se corre con el scroll y la
+  carril nuevo en vez de estirar un bitmap chico. Los carriles crecen con la ventana: **90 px de
+  onda como piso**, y el alto sobrante se reparte 1/3 para el panel de ondas y 2/3 para la fila de
+  paneles (a 1080p: carriles de 182 px y paneles de 610 px; a la ventana inicial, 132 y 410).
+  Dentro de los paneles el contenido se reparte: las siete filas de cada deck van de borde a borde
+  con huecos iguales (`alignment: space-between`; medido 72–75 px a 1080p contra los ~554 px muertos
+  que dejaba el centrado anterior) y el mixer reparte sus bloques en huecos iguales con los vumetros
+  creciendo hasta 380 px. El playhead es un rectángulo fijo de la UI, no parte del bitmap: la tira se
+  corre con el scroll y la
   referencia vertical queda clavada en el centro del carril. Los controles de zoom (`− 8 s +`) viven
   entre los dos carriles, no arriba: así las ondas quedan pegadas al borde superior y no se come alto.
   La ventana es fluida: no declara `width`/`height` en Slint (eso clavaba el contenido y al maximizar

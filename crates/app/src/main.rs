@@ -195,7 +195,11 @@ slint::slint! {
                 Text { text: root.time-text; color: #66727f; font-size: 11px; vertical-alignment: center; }
             }
             body := Rectangle {
-                height: 90px;
+                // El carril crece con la ventana, pero nunca baja de 90 px:
+                // es el alto con el que la onda se lee bien en la ventana
+                // inicial. El bitmap se redibuja a la altura real (real-h).
+                min-height: 90px;
+                vertical-stretch: 1;
                 background: #070a0e;
                 border-radius: 6px;
                 clip: true;
@@ -484,7 +488,11 @@ slint::slint! {
         VerticalLayout {
             padding: 12px;
             spacing: 8px;
-            alignment: center;
+            // space-between: la primera fila queda arriba y la última (HIGH)
+            // abajo; los seis huecos entre las siete filas quedan iguales.
+            // Con `alignment: center` el bloque quedaba centrado y al
+            // maximizar sobraban ~550 px muertos arriba y abajo.
+            alignment: space-between;
 
             HorizontalLayout {
                 spacing: 8px;
@@ -596,22 +604,33 @@ slint::slint! {
         VerticalLayout {
             padding: 12px;
             spacing: 10px;
-            alignment: center;
+            // stretch + separadores con vertical-stretch: el alto sobrante se
+            // reparte en huecos iguales (medido: 71 px a 1080p, 107 px a 1400)
+            // y los vumetros crecen con tope, sin quedar como hilos.
+            alignment: stretch;
 
             Text { text: "MIXER"; color: #66727f; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+
+            Rectangle { vertical-stretch: 1; }
 
             HorizontalLayout {
                 spacing: 14px;
                 alignment: center;
-                // Alto explícito: con el layout padre centrado, un hijo con
-                // vertical-stretch se colapsa a 0 y los vumetros desaparecen.
-                height: 160px;
+                // 160 px es el alto mínimo legible; el tope de 380 evita que en
+                // una ventana muy alta los medidores queden como tiras.
+                min-height: 160px;
+                max-height: 380px;
+                vertical-stretch: 2;
                 VuMeter { level: root.meter-a; accent: #22d3ee; }
                 VuMeter { level: root.meter-b; accent: #fbbf24; }
                 VuMeter { level: root.master; accent: #9aa7b6; }
             }
 
+            Rectangle { vertical-stretch: 1; }
+
             Text { text: "A · B · MASTER"; color: #4b5663; font-size: 9px; horizontal-alignment: center; }
+
+            Rectangle { vertical-stretch: 1; }
 
             HorizontalLayout {
                 spacing: 6px;
@@ -622,6 +641,8 @@ slint::slint! {
                 }
                 Text { text: "B"; color: #fbbf24; font-size: 12px; font-weight: 800; vertical-alignment: center; }
             }
+
+            Rectangle { vertical-stretch: 1; }
 
             Text { text: "CROSSFADER"; color: #4b5663; font-size: 9px; horizontal-alignment: center; }
         }
@@ -729,7 +750,11 @@ slint::slint! {
             padding: 12px;
             spacing: 10px;
 
+            // El panel de ondas se lleva 1/3 del alto sobrante y la fila de
+            // paneles 2/3: así al maximizar también crecen las ondas, pero
+            // menos que los controles, que necesitan el alto para repartirse.
             Rectangle {
+                vertical-stretch: 1;
                 background: #0c1116;
                 border-radius: 10px;
                 border-width: 1px;
@@ -739,11 +764,11 @@ slint::slint! {
                     padding: 10px;
                     spacing: 6px;
 
-                    // Los carriles no se estiran: el panel mide su contenido
-                    // (2 x 109 px + fila de zoom + padding) y así las ondas
-                    // quedan pegadas arriba. El alto sobrante lo toma la fila
-                    // de paneles de deck, que lo centra dentro suyo.
+                    // Los carriles se reparten el alto del panel: en la
+                    // ventana inicial miden 109 px (90 de onda) y al maximizar
+                    // crecen. La fila de zoom queda fija entre los dos.
                     lane-a := Lane {
+                        vertical-stretch: 1;
                         label: "A";
                         accent: #22d3ee;
                         track-name: root.name-a;
@@ -794,6 +819,7 @@ slint::slint! {
                     }
 
                     lane-b := Lane {
+                        vertical-stretch: 1;
                         label: "B";
                         accent: #fbbf24;
                         track-name: root.name-b;
@@ -811,7 +837,7 @@ slint::slint! {
 
             HorizontalLayout {
                 spacing: 10px;
-                vertical-stretch: 1;
+                vertical-stretch: 2;
 
                 DeckPanel {
                     width: 35%;
