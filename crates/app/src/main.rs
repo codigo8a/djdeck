@@ -561,7 +561,7 @@ slint::slint! {
                 spacing: 6px;
                 Text { text: "LOW"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
                 Slider {
-                    minimum: -12.0; maximum: 12.0; value: root.eq-low;
+                    minimum: -26.0; maximum: 12.0; value: root.eq-low;
                     changed(v) => { root.eq-low = v; root.eq-low-changed(v); }
                 }
                 Text { text: root.low-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
@@ -571,7 +571,7 @@ slint::slint! {
                 spacing: 6px;
                 Text { text: "MID"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
                 Slider {
-                    minimum: -12.0; maximum: 12.0; value: root.eq-mid;
+                    minimum: -26.0; maximum: 12.0; value: root.eq-mid;
                     changed(v) => { root.eq-mid = v; root.eq-mid-changed(v); }
                 }
                 Text { text: root.mid-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
@@ -581,7 +581,7 @@ slint::slint! {
                 spacing: 6px;
                 Text { text: "HIGH"; color: #66727f; font-size: 10px; width: 40px; vertical-alignment: center; }
                 Slider {
-                    minimum: -12.0; maximum: 12.0; value: root.eq-high;
+                    minimum: -26.0; maximum: 12.0; value: root.eq-high;
                     changed(v) => { root.eq-high = v; root.eq-high-changed(v); }
                 }
                 Text { text: root.high-text; color: #dbe4ee; font-size: 11px; width: 22%; min-width: 58px; horizontal-alignment: right; vertical-alignment: center; }
@@ -1428,6 +1428,9 @@ fn main() -> Result<()> {
                         ui.set_low_a_text(zero_db.clone());
                         ui.set_mid_a_text(zero_db.clone());
                         ui.set_high_a_text(zero_db);
+                        ui.set_eq_low_a(0.0);
+                        ui.set_eq_mid_a(0.0);
+                        ui.set_eq_high_a(0.0);
                         ui.set_synced_a(false);
                         ui.set_looping_a(false);
                     } else {
@@ -1438,6 +1441,9 @@ fn main() -> Result<()> {
                         ui.set_low_b_text(zero_db.clone());
                         ui.set_mid_b_text(zero_db.clone());
                         ui.set_high_b_text(zero_db);
+                        ui.set_eq_low_b(0.0);
+                        ui.set_eq_mid_b(0.0);
+                        ui.set_eq_high_b(0.0);
                         ui.set_synced_b(false);
                         ui.set_looping_b(false);
                     }
@@ -1770,11 +1776,7 @@ fn main() -> Result<()> {
                     engine::get_f32(&controls.eq_mid[i]),
                     engine::get_f32(&controls.eq_high[i]),
                 );
-                let (a, b, c) = (
-                    format!("{:+.1} dB", lo),
-                    format!("{:+.1} dB", mi),
-                    format!("{:+.1} dB", hi),
-                );
+                let (a, b, c) = (fmt_db(lo), fmt_db(mi), fmt_db(hi));
                 if i == 0 {
                     ui.set_low_a_text(a.into());
                     ui.set_mid_a_text(b.into());
@@ -2136,6 +2138,17 @@ fn reset_pitch(
         toggle_sync(controls, decks, ui, deck);
     }
     set_pitch(controls, decks, deck, 0.0);
+}
+
+/// Etiqueta de una banda del EQ. El fondo del recorrido es el kill: -26 dB deja
+/// la banda prácticamente afuera (medido: -26 dB a 50 Hz / 1 kHz / 12 kHz), así
+/// que ahí se rotula KILL en vez de un número que no dice nada.
+fn fmt_db(v: f32) -> slint::SharedString {
+    if v <= -25.5 {
+        "KILL".into()
+    } else {
+        format!("{v:+.1} dB").into()
+    }
 }
 
 fn fmt_time(pos: f64, len: f64) -> String {

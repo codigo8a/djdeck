@@ -38,8 +38,15 @@ djdeck --selftest                   # verificación sin UI ni placa de sonido
   sin click). Con un loop activo, pulsar el mismo largo lo apaga; pulsar el otro largo lo reemplaza.
   El tramo que abarca el loop se marca en la onda con una sombra tenue del color del deck, para ver
   exactamente qué compases se repiten.
-- EQ de 3 bandas **real** por deck (low shelf 200 Hz, campana 1 kHz, high shelf 4 kHz, ±12 dB), con
-  bypass exacto cuando las tres están en 0 dB.
+- EQ de 3 bandas **real** por deck: low shelf 200 Hz, campana 1 kHz (Q 0.8), high shelf 4 kHz, de
+  **−26 dB (KILL) a +12 dB**. Respuesta medida: LOW +12 → +11.9 dB a 50 Hz, +6.0 a 200 Hz y 0.0 a
+  1 kHz; MID +12 → +12.0 a 1 kHz, +1.0 a 200 Hz, +0.3 a 8 kHz; HIGH +12 → +11.9 a 12 kHz, +6.0 a
+  4 kHz y 0.0 a 100 Hz; con las tres en el fondo la banda queda a −26 dB. Los coeficientes no saltan:
+  un cambio de ganancia se interpola en 1024 muestras (~21 ms a 48 kHz) porque un arrastre brusco
+  metía un click en los graves (medido sin rampa: el salto entre muestras a 100 Hz era 3.6× el
+  natural; con rampa queda 1.0×). Costo medido del EQ: 19 ns por frame estéreo = 0.020 ms por bloque
+  de 1024 frames, contra un período de 21.3 ms (0.1 %); en bypass 3.8 ns/frame. Bypass exacto
+  (bit-idéntico) cuando las tres están en 0 dB.
 - Gain por canal + crossfader equal-power (−3 dB en el centro) + limitador suave.
 - Sync: iguala tempo (relación de BPM, recortada a ±8 %) y corrige fase contra el otro deck
   con un offset de rate de hasta ±3 %, con deadband de 0.004 beat para no vibrar. El SYNC de un deck
